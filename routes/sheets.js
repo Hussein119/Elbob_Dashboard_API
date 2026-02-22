@@ -14,8 +14,10 @@ const router = Router()
 const SHEET_ID = process.env.SHEET_ID
 
 // ── Helper: get Google token or return 401 ──────────────────────────
+// Passes req so tokenStore can decrypt the token from the JWT payload
+// rather than relying on the in-memory Map (which dies on cold starts).
 function getGoogleToken(req, res) {
-  const token = tokenStore.get(req.user.userId)
+  const token = tokenStore.get(req.user.userId, req)
   if (!token) {
     res.status(401).json({
       error: 'Google session expired. Please reconnect Google Sheets.',

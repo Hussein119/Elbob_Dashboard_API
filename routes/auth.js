@@ -57,10 +57,15 @@ router.post('/verify', async (req, res) => {
     // 5. If admin, make their token available for sheet user-management calls
     if (found.role === 'admin') setAdminEmail(email)
 
-    // 6. Issue JWT
+    // 6. Issue JWT — embed encrypted Google token so it survives cold starts
     const payload = {
-      userId: email, name: profile.name || profile.given_name || email,
-      email, picture: profile.picture || null, role: found.role,
+      userId:                 email,
+      name:                   profile.name || profile.given_name || email,
+      email,
+      picture:                profile.picture || null,
+      role:                   found.role,
+      encryptedGoogleToken:   tokenStore.encrypt(googleAccessToken),
+      googleTokenExpiresAt:   Date.now() + 55 * 60 * 1000,
     }
     const token = jwt.sign(payload, process.env.JWT_SECRET, {
       expiresIn: process.env.JWT_EXPIRES_IN || '8h',
@@ -75,7 +80,7 @@ router.post('/verify', async (req, res) => {
 
 // ── GET /api/auth/me ─────────────────────────────────────────────────
 router.get('/me', requireAuth, (req, res) => {
-  res.json({ user: req.user, googleExpiringSoon: tokenStore.isExpiringSoon(req.user.userId) })
+  res.json({ user: req.user, googleExpiringSoon: tokenStore.isExpiringSoon(req.user.userId, req) })
 })
 
 // ── POST /api/auth/logout ────────────────────────────────────────────
@@ -98,7 +103,19 @@ router.post('/refresh-google', requireAuth, async (req, res) => {
     if (email !== req.user.userId) return res.status(403).json({ error: 'Token belongs to a different account' })
     tokenStore.set(email, googleAccessToken)
     if (req.user.role === 'admin') setAdminEmail(email)
-    res.json({ success: true })
+
+    // Re-issue the JWT with the freshly encrypted Google token
+    const payload = {
+      ...req.user,
+      encryptedGoogleToken: tokenStore.encrypt(googleAccessToken),
+      googleTokenExpiresAt: Date.now() + 55 * 60 * 1000,
+    }
+    delete payload.iat
+    delete payload.exp
+    const newJwt = jwt.sign(payload, process.env.JWT_SECRET, {
+      expiresIn: process.env.JWT_EXPIRES_IN || '8h',
+    })
+    res.json({ success: true, token: newJwt })
   } catch (err) {
     console.error('[auth/refresh-google]', err)
     res.status(500).json({ error: 'Failed to refresh token' })

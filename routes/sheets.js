@@ -111,8 +111,23 @@ router.put('/row/:rowIndex', requireAuth, async (req, res) => {
   const googleToken = getGoogleToken(req, res)
   if (!googleToken) return
 
-  const { rowIndex }          = req.params
-  const { values, sheetName } = req.body
+  const { rowIndex } = req.params
+
+  // Robustly read body — on Vercel serverless, body-parser may not fire for PUT
+  let parsedBody = req.body
+  if (!parsedBody || typeof parsedBody !== 'object' || !Object.keys(parsedBody).length) {
+    try {
+      const raw = await new Promise((resolve, reject) => {
+        let data = ''
+        req.on('data', chunk => { data += chunk })
+        req.on('end', () => resolve(data))
+        req.on('error', reject)
+      })
+      parsedBody = raw ? JSON.parse(raw) : {}
+    } catch { parsedBody = {} }
+  }
+
+  const { values, sheetName } = parsedBody
   if (!values || !sheetName) {
     return res.status(400).json({ error: 'values and sheetName are required' })
   }

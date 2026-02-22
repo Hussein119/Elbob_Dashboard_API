@@ -51,7 +51,7 @@ app.use(express.json({ limit: '1mb' }))
 // Auth endpoints: strict (prevent brute-force / token stuffing)
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,   // 15 minutes
-  max:      20,               // 20 requests per window
+  max:      100,               // 20 requests per window
   message:  { error: 'Too many auth requests. Please wait 15 minutes.' },
   standardHeaders: true,
   legacyHeaders:   false,

@@ -1,138 +1,204 @@
 // routes/auth.js
-//
-// POST /api/auth/verify   — receives Google access_token from frontend,
-//                           verifies it with Google, assigns role, returns our JWT
-// GET  /api/auth/me       — returns current user info from JWT
-// POST /api/auth/logout   — deletes server-side Google token
-// POST /api/auth/refresh  — tells client whether Google re-auth is needed
 
-import { Router }    from 'express'
-import jwt           from 'jsonwebtoken'
-import fetch         from 'node-fetch'
-import { tokenStore } from '../config/tokenStore.js'
+import { Router }      from 'express'
+import jwt             from 'jsonwebtoken'
+import fetch           from 'node-fetch'
+import { tokenStore }  from '../config/tokenStore.js'
 import { requireAuth } from '../middleware/auth.js'
+import {
+  setAdminEmail, lookupUser, getAllUsers, addUser,
+  removeUser, updateUserRole, getUsersTabSheetId,
+  refreshCache, isReady,
+} from '../config/userStore.js'
 
 const router = Router()
 
-// Admin emails (server-side only — never exposed to client)
-const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
-  .split(',')
-  .map(e => e.trim().toLowerCase())
-  .filter(Boolean)
+const BOOTSTRAP_ADMINS = (process.env.ADMIN_EMAILS || '')
+  .split(',').map(e => e.trim().toLowerCase()).filter(Boolean)
 
-// ── POST /api/auth/verify ───────────────────────────────────────────
-// Frontend sends: { googleAccessToken }
-// We verify it with Google, assign role, store google token server-side,
-// return our own signed JWT (contains NO google token).
+// ── POST /api/auth/verify ────────────────────────────────────────────
 router.post('/verify', async (req, res) => {
   const { googleAccessToken } = req.body
-
-  if (!googleAccessToken || typeof googleAccessToken !== 'string') {
+  if (!googleAccessToken || typeof googleAccessToken !== 'string')
     return res.status(400).json({ error: 'googleAccessToken is required' })
-  }
 
   try {
-    // 1. Verify token with Google and fetch profile
-    const googleRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+    // 1. Verify with Google
+    const gRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
       headers: { Authorization: `Bearer ${googleAccessToken}` },
     })
+    if (!gRes.ok) return res.status(401).json({ error: 'Invalid or expired Google token' })
 
-    if (!googleRes.ok) {
-      return res.status(401).json({ error: 'Invalid or expired Google token' })
-    }
-
-    const profile = await googleRes.json()
+    const profile = await gRes.json()
     const email   = (profile.email || '').toLowerCase().trim()
+    if (!email) return res.status(401).json({ error: 'Could not retrieve email from Google' })
 
-    if (!email) {
-      return res.status(401).json({ error: 'Could not retrieve email from Google' })
-    }
-
-    // 2. Assign role server-side based on email
-    const role = ADMIN_EMAILS.includes(email) ? 'admin' : 'user'
-
-    // 3. Store Google token server-side — NEVER sent to the client
+    // 2. Store token immediately so userStore can use it if this is an admin
     tokenStore.set(email, googleAccessToken)
 
-    // 4. Issue our own short-lived JWT
-    //    Payload contains only safe, non-sensitive user info
-    const jwtPayload = {
-      userId:  email,
-      name:    profile.name || profile.given_name || email,
-      email,
-      picture: profile.picture || null,
-      role,
+    // 3. If bootstrap admin → register as the active admin token provider
+    if (BOOTSTRAP_ADMINS.includes(email)) setAdminEmail(email)
+
+    // 4. Look up user (bootstrap env check + sheet check)
+    let found
+    try {
+      found = await lookupUser(email)
+    } catch (e) {
+      console.warn('[auth/verify] lookupUser error:', e.message)
+      // Sheet unreachable — only let bootstrap admins through
+      found = BOOTSTRAP_ADMINS.includes(email) ? { email, role: 'admin' } : null
     }
 
-    const token = jwt.sign(jwtPayload, process.env.JWT_SECRET, {
+    if (!found) {
+      tokenStore.delete(email)
+      return res.status(403).json({ error: 'غير مصرح لك بالدخول. تواصل مع المدير لإضافتك.' })
+    }
+
+    // 5. If admin, make their token available for sheet user-management calls
+    if (found.role === 'admin') setAdminEmail(email)
+
+    // 6. Issue JWT
+    const payload = {
+      userId: email, name: profile.name || profile.given_name || email,
+      email, picture: profile.picture || null, role: found.role,
+    }
+    const token = jwt.sign(payload, process.env.JWT_SECRET, {
       expiresIn: process.env.JWT_EXPIRES_IN || '8h',
     })
 
-    // 5. Return JWT + user info (no google token)
-    return res.json({
-      token,
-      user: jwtPayload,
-      tokenExpiresIn: process.env.JWT_EXPIRES_IN || '8h',
-    })
-
+    return res.json({ token, user: payload, tokenExpiresIn: process.env.JWT_EXPIRES_IN || '8h' })
   } catch (err) {
-    console.error('[auth/verify] Error:', err)
+    console.error('[auth/verify]', err)
     return res.status(500).json({ error: 'Authentication failed. Please try again.' })
   }
 })
 
-// ── GET /api/auth/me ────────────────────────────────────────────────
-// Returns current user from JWT. Also reports if Google token is expiring soon.
+// ── GET /api/auth/me ─────────────────────────────────────────────────
 router.get('/me', requireAuth, (req, res) => {
-  const googleExpiringSoon = tokenStore.isExpiringSoon(req.user.userId)
-  res.json({
-    user: req.user,
-    googleExpiringSoon,   // frontend can use this to prompt re-auth
-  })
+  res.json({ user: req.user, googleExpiringSoon: tokenStore.isExpiringSoon(req.user.userId) })
 })
 
-// ── POST /api/auth/logout ───────────────────────────────────────────
-// Deletes the server-side Google token.
-// The client should also discard its JWT.
+// ── POST /api/auth/logout ────────────────────────────────────────────
 router.post('/logout', requireAuth, (req, res) => {
   tokenStore.delete(req.user.userId)
   res.json({ success: true })
 })
 
-// ── POST /api/auth/refresh-google ──────────────────────────────────
-// Called by the frontend when Google token has expired.
-// Frontend sends a new googleAccessToken (from a silent re-auth).
+// ── POST /api/auth/refresh-google ───────────────────────────────────
 router.post('/refresh-google', requireAuth, async (req, res) => {
   const { googleAccessToken } = req.body
-  if (!googleAccessToken) {
-    return res.status(400).json({ error: 'googleAccessToken is required' })
+  if (!googleAccessToken) return res.status(400).json({ error: 'googleAccessToken is required' })
+  try {
+    const gRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${googleAccessToken}` },
+    })
+    if (!gRes.ok) return res.status(401).json({ error: 'Invalid Google token' })
+    const profile = await gRes.json()
+    const email   = (profile.email || '').toLowerCase().trim()
+    if (email !== req.user.userId) return res.status(403).json({ error: 'Token belongs to a different account' })
+    tokenStore.set(email, googleAccessToken)
+    if (req.user.role === 'admin') setAdminEmail(email)
+    res.json({ success: true })
+  } catch (err) {
+    console.error('[auth/refresh-google]', err)
+    res.status(500).json({ error: 'Failed to refresh token' })
+  }
+})
+
+// ── GET /api/auth/users ──────────────────────────────────────────────
+router.get('/users', requireAuth, async (req, res) => {
+  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Admin only' })
+
+  // Ensure this admin's token is registered as the active one
+  const myToken = tokenStore.get(req.user.userId)
+  if (myToken) setAdminEmail(req.user.userId)
+
+  // If no admin token available yet (cold start before any admin logged in)
+  if (!isReady()) {
+    const users = BOOTSTRAP_ADMINS.map(e => ({ email: e, role: 'admin', addedBy: 'env', addedAt: '' }))
+    return res.json({ users, sheetId: null, sheetReady: false })
   }
 
   try {
-    // Verify the new token belongs to the same user
-    const googleRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-      headers: { Authorization: `Bearer ${googleAccessToken}` },
-    })
-
-    if (!googleRes.ok) {
-      return res.status(401).json({ error: 'Invalid Google token' })
-    }
-
-    const profile = await googleRes.json()
-    const email   = (profile.email || '').toLowerCase().trim()
-
-    // Must match the JWT user
-    if (email !== req.user.userId) {
-      return res.status(403).json({ error: 'Token belongs to a different account' })
-    }
-
-    // Update server-side store
-    tokenStore.set(email, googleAccessToken)
-
-    res.json({ success: true, message: 'Google token refreshed successfully' })
+    const [users, sheetId] = await Promise.all([getAllUsers(), getUsersTabSheetId()])
+    res.json({ users, sheetId, sheetReady: true })
   } catch (err) {
-    console.error('[auth/refresh-google] Error:', err)
-    return res.status(500).json({ error: 'Failed to refresh token' })
+    console.error('[auth/users GET]', err)
+    const users = BOOTSTRAP_ADMINS.map(e => ({ email: e, role: 'admin', addedBy: 'env', addedAt: '' }))
+    res.json({ users, sheetId: null, sheetReady: false, error: err.message })
+  }
+})
+
+// ── POST /api/auth/users ─────────────────────────────────────────────
+router.post('/users', requireAuth, async (req, res) => {
+  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Admin only' })
+
+  const myToken = tokenStore.get(req.user.userId)
+  if (myToken) setAdminEmail(req.user.userId)
+
+  const { email, role } = req.body
+  if (!email || !role) return res.status(400).json({ error: 'email and role are required' })
+  if (!['admin', 'user'].includes(role)) return res.status(400).json({ error: 'role must be admin or user' })
+
+  const e = email.toLowerCase().trim()
+  if (BOOTSTRAP_ADMINS.includes(e))
+    return res.status(400).json({ error: 'هذا المستخدم موجود بالفعل كمشرف في إعدادات الخادم' })
+
+  try {
+    const existing = await getAllUsers()
+    if (existing.find(u => u.email === e))
+      return res.status(409).json({ error: 'المستخدم مضاف بالفعل' })
+
+    await addUser(e, role, req.user.email)
+    const [users, sheetId] = await Promise.all([getAllUsers(), getUsersTabSheetId()])
+    res.json({ success: true, users, sheetId, sheetReady: true })
+  } catch (err) {
+    console.error('[auth/users POST]', err)
+    res.status(500).json({ error: err.message || 'Failed to add user' })
+  }
+})
+
+// ── PUT /api/auth/users/:rowIndex ────────────────────────────────────
+router.put('/users/:rowIndex', requireAuth, async (req, res) => {
+  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Admin only' })
+  const rowNum = parseInt(req.params.rowIndex)
+  const { role } = req.body
+  if (!role || !['admin', 'user'].includes(role)) return res.status(400).json({ error: 'Valid role required' })
+  if (isNaN(rowNum) || rowNum < 2) return res.status(400).json({ error: 'Invalid rowIndex' })
+
+  const myToken = tokenStore.get(req.user.userId)
+  if (myToken) setAdminEmail(req.user.userId)
+
+  try {
+    await updateUserRole(rowNum, role)
+    await refreshCache()
+    const [users, sheetId] = await Promise.all([getAllUsers(), getUsersTabSheetId()])
+    res.json({ success: true, users, sheetId, sheetReady: true })
+  } catch (err) {
+    console.error('[auth/users PUT]', err)
+    res.status(500).json({ error: err.message || 'Failed to update role' })
+  }
+})
+
+// ── DELETE /api/auth/users/:rowIndex ─────────────────────────────────
+router.delete('/users/:rowIndex', requireAuth, async (req, res) => {
+  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Admin only' })
+  const rowNum  = parseInt(req.params.rowIndex)
+  const sheetId = parseInt(req.query.sheetId)
+  if (isNaN(rowNum) || rowNum < 2) return res.status(400).json({ error: 'Invalid rowIndex' })
+  if (isNaN(sheetId)) return res.status(400).json({ error: 'sheetId query param required' })
+
+  const myToken = tokenStore.get(req.user.userId)
+  if (myToken) setAdminEmail(req.user.userId)
+
+  try {
+    await removeUser(rowNum, sheetId)
+    await refreshCache()
+    const [users, sid] = await Promise.all([getAllUsers(), getUsersTabSheetId()])
+    res.json({ success: true, users, sheetId: sid, sheetReady: true })
+  } catch (err) {
+    console.error('[auth/users DELETE]', err)
+    res.status(500).json({ error: err.message || 'Failed to remove user' })
   }
 })
 

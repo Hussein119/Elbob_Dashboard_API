@@ -185,4 +185,94 @@ router.delete('/row/:rowIndex', requireAuth, async (req, res) => {
   }
 })
 
+// ─────────────────────────────────────────────────────────────────────
+// POST /api/sheets/ensure-tab
+// Body: { tabName: "مشتريات بضاعة", headers: ["col1", "col2", ...] }
+// Creates a new sheet tab if it doesn't already exist, then writes headers.
+// Returns: { created: true/false, sheetId, tabName }
+// ─────────────────────────────────────────────────────────────────────
+router.post('/ensure-tab', requireAuth, async (req, res) => {
+  const googleToken = getGoogleToken(req, res)
+  if (!googleToken) return
+
+  const { tabName, headers } = req.body
+  if (!tabName || !Array.isArray(headers) || headers.length === 0) {
+    return res.status(400).json({ error: 'tabName and headers[] are required' })
+  }
+
+  try {
+    // 1. Fetch existing sheets
+    const metaRes = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}?fields=sheets.properties`,
+      { headers: { Authorization: `Bearer ${googleToken}` } }
+    )
+    if (!metaRes.ok) return handleGoogleError(metaRes, res)
+
+    const meta   = await metaRes.json()
+    const sheets = meta.sheets || []
+    const existing = sheets.find(s => s.properties.title === tabName)
+
+    if (existing) {
+      // Tab already exists — return its id
+      return res.json({ created: false, sheetId: existing.properties.sheetId, tabName })
+    }
+
+    // 2. Create the new tab
+    const addRes = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}:batchUpdate`,
+      {
+        method:  'POST',
+        headers: { Authorization: `Bearer ${googleToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          requests: [{ addSheet: { properties: { title: tabName } } }],
+        }),
+      }
+    )
+    if (!addRes.ok) return handleGoogleError(addRes, res)
+
+    const addData  = await addRes.json()
+    const newSheetId = addData.replies[0].addSheet.properties.sheetId
+
+    // 3. Write header row
+    const headerUrl = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(tabName + '!A1')}?valueInputOption=USER_ENTERED`
+    const hRes = await fetch(headerUrl, {
+      method:  'PUT',
+      headers: { Authorization: `Bearer ${googleToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values: [headers] }),
+    })
+    if (!hRes.ok) return handleGoogleError(hRes, res)
+
+    return res.json({ created: true, sheetId: newSheetId, tabName })
+  } catch (err) {
+    console.error('[sheets/ensure-tab]', err)
+    res.status(500).json({ error: 'Failed to ensure tab' })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// GET /api/sheets/tab-data?tabName=مشتريات بضاعة
+// Returns all rows (including header) from the specified tab.
+// ─────────────────────────────────────────────────────────────────────
+router.get('/tab-data', requireAuth, async (req, res) => {
+  const googleToken = getGoogleToken(req, res)
+  if (!googleToken) return
+
+  const { tabName } = req.query
+  if (!tabName) return res.status(400).json({ error: 'tabName query param is required' })
+
+  try {
+    const valRes = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(tabName + '!A:Z')}`,
+      { headers: { Authorization: `Bearer ${googleToken}` } }
+    )
+    if (!valRes.ok) return handleGoogleError(valRes, res)
+
+    const data = await valRes.json()
+    res.json({ values: data.values || [], tabName })
+  } catch (err) {
+    console.error('[sheets/tab-data]', err)
+    res.status(500).json({ error: 'Failed to fetch tab data' })
+  }
+})
+
 export default router

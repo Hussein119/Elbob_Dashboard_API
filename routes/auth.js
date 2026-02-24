@@ -161,6 +161,11 @@ router.post('/users', requireAuth, async (req, res) => {
   if (BOOTSTRAP_ADMINS.includes(e))
     return res.status(400).json({ error: 'هذا المستخدم موجود بالفعل كمشرف في إعدادات الخادم' })
 
+  const BOOTSTRAP_USERS = (process.env.USER_EMAILS || '')
+    .split(',').map(x => x.trim().toLowerCase()).filter(Boolean)
+  if (BOOTSTRAP_USERS.includes(e))
+    return res.status(400).json({ error: 'هذا المستخدم موجود بالفعل كمستخدم في إعدادات الخادم' })
+
   try {
     const existing = await getAllUsers()
     if (existing.find(u => u.email === e))

@@ -97,13 +97,18 @@ export async function refreshCache() {
 
 // ── Public API ────────────────────────────────────────────────────────
 
-/** Called at login time. Bootstrap admins always pass; others checked against sheet. */
+/** Called at login time. Bootstrap admins/users always pass; others checked against sheet. */
 export async function lookupUser(email) {
   const e = email.toLowerCase().trim()
 
   const bootstrapAdmins = (process.env.ADMIN_EMAILS || '')
     .split(',').map(x => x.trim().toLowerCase()).filter(Boolean)
   if (bootstrapAdmins.includes(e)) return { email: e, role: 'admin' }
+
+  // Bootstrap users — defined in USER_EMAILS env var, always have role 'user'
+  const bootstrapUsers = (process.env.USER_EMAILS || '')
+    .split(',').map(x => x.trim().toLowerCase()).filter(Boolean)
+  if (bootstrapUsers.includes(e)) return { email: e, role: 'user' }
 
   // Need an admin token to read the sheet
   if (!adminEmail || !tokenStore.get(adminEmail)) {
@@ -120,11 +125,17 @@ export async function getAllUsers() {
 
   const bootstrapAdmins = (process.env.ADMIN_EMAILS || '')
     .split(',').map(x => x.trim().toLowerCase()).filter(Boolean)
+  const bootstrapUsers = (process.env.USER_EMAILS || '')
+    .split(',').map(x => x.trim().toLowerCase()).filter(Boolean)
   const sheetUsers  = cache ? [...cache.values()] : []
   const sheetEmails = new Set(sheetUsers.map(u => u.email))
-  const envOnly     = bootstrapAdmins
+  const envAdmins   = bootstrapAdmins
     .filter(e => !sheetEmails.has(e))
     .map(e => ({ email: e, role: 'admin', addedBy: 'env', addedAt: '' }))
+  const envUsers    = bootstrapUsers
+    .filter(e => !sheetEmails.has(e) && !bootstrapAdmins.includes(e))
+    .map(e => ({ email: e, role: 'user', addedBy: 'env', addedAt: '' }))
+  const envOnly = [...envAdmins, ...envUsers]
 
   return [...envOnly, ...sheetUsers]
 }

@@ -13,6 +13,17 @@ const router = Router()
 
 const SHEET_ID = process.env.SHEET_ID
 
+// ── Helper: convert 1-based column index to letter(s) (e.g. 1→A, 26→Z, 27→AA) ──
+function colIndexToLetter(index) {
+  let letter = ''
+  while (index > 0) {
+    const mod = (index - 1) % 26
+    letter = String.fromCharCode(65 + mod) + letter
+    index  = Math.floor((index - 1) / 26)
+  }
+  return letter
+}
+
 // ── Helper: get Google token or return 401 ──────────────────────────
 // Passes req so tokenStore can decrypt the token from the JWT payload
 // rather than relying on the in-memory Map (which dies on cold starts).
@@ -59,7 +70,7 @@ router.get('/data', requireAuth, async (req, res) => {
 
     // Step 2: fetch values
     const valRes = await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName + '!A:L')}`,
+      `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName + '!A:Z')}`,
       { headers: { Authorization: `Bearer ${googleToken}` } }
     )
     if (!valRes.ok) return handleGoogleError(valRes, res)
@@ -91,7 +102,7 @@ router.post('/append', requireAuth, async (req, res) => {
   }
 
   try {
-    const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName + '!A:L')}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`
+    const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName + '!A:Z')}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`
     const gRes = await fetch(url, {
       method:  'POST',
       headers: { Authorization: `Bearer ${googleToken}`, 'Content-Type': 'application/json' },
@@ -140,7 +151,10 @@ router.put('/row/:rowIndex', requireAuth, async (req, res) => {
   }
 
   try {
-    const range = `${sheetName}!A${rowNum}:L${rowNum}`
+    // Determine last column letter dynamically based on values array length
+    const colCount  = Array.isArray(values[0]) ? values[0].length : values.length
+    const lastCol   = colIndexToLetter(colCount)
+    const range = `${sheetName}!A${rowNum}:${lastCol}${rowNum}`
     const url   = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(range)}?valueInputOption=USER_ENTERED`
     const gRes  = await fetch(url, {
       method:  'PUT',

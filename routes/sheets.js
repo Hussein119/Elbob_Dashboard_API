@@ -102,9 +102,30 @@ router.post('/append', requireAuth, async (req, res) => {
   }
 
   try {
-    const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName + '!A:Z')}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`
+    // Find the actual last row (including empty rows) to append after it
+    const metaUrl = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}?fields=sheets(properties(title,sheetId,gridProperties(rowCount)))`
+    const metaRes = await fetch(metaUrl, {
+      headers: { Authorization: `Bearer ${googleToken}` },
+    })
+    if (!metaRes.ok) return handleGoogleError(metaRes, res)
+    const meta = await metaRes.json()
+    const sheet = meta.sheets?.find(s => s.properties.title === sheetName)
+    const totalRows = sheet?.properties?.gridProperties?.rowCount || 1000
+
+    // Read all rows to find the last non-empty row
+    const dataUrl = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName + '!A1:A' + totalRows)}`
+    const dataRes = await fetch(dataUrl, {
+      headers: { Authorization: `Bearer ${googleToken}` },
+    })
+    if (!dataRes.ok) return handleGoogleError(dataRes, res)
+    const dataBody = await dataRes.json()
+    const lastRow = (dataBody.values?.length || 0) + 1
+
+    // Write directly to the row after the last one
+    const range = encodeURIComponent(`${sheetName}!A${lastRow}`)
+    const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${range}?valueInputOption=USER_ENTERED`
     const gRes = await fetch(url, {
-      method:  'POST',
+      method:  'PUT',
       headers: { Authorization: `Bearer ${googleToken}`, 'Content-Type': 'application/json' },
       body:    JSON.stringify({ values }),
     })

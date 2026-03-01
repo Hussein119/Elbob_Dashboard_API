@@ -3,7 +3,6 @@
 import { Router }      from 'express'
 import jwt             from 'jsonwebtoken'
 import fetch           from 'node-fetch'
-import { tokenStore }  from '../config/tokenStore.js'
 import { requireAuth } from '../middleware/auth.js'
 import {
   setAdminEmail, lookupUser, getAllUsers, addUser,
@@ -33,13 +32,10 @@ router.post('/verify', async (req, res) => {
     const email   = (profile.email || '').toLowerCase().trim()
     if (!email) return res.status(401).json({ error: 'Could not retrieve email from Google' })
 
-    // 2. Store token immediately so userStore can use it if this is an admin
-    tokenStore.set(email, googleAccessToken)
-
-    // 3. If bootstrap admin → register as the active admin token provider
+    // 2. If bootstrap admin → register as the active admin token provider
     if (BOOTSTRAP_ADMINS.includes(email)) setAdminEmail(email)
 
-    // 4. Look up user (bootstrap env check + sheet check)
+    // 3. Look up user (bootstrap env check + sheet check)
     let found
     try {
       found = await lookupUser(email)
@@ -50,22 +46,19 @@ router.post('/verify', async (req, res) => {
     }
 
     if (!found) {
-      tokenStore.delete(email)
       return res.status(403).json({ error: 'غير مصرح لك بالدخول. تواصل مع المدير لإضافتك.' })
     }
 
-    // 5. If admin, make their token available for sheet user-management calls
+    // 4. If admin, register their email
     if (found.role === 'admin') setAdminEmail(email)
 
-    // 6. Issue JWT — embed encrypted Google token so it survives cold starts
+    // 5. Issue JWT — identity only, no Google token embedded
     const payload = {
-      userId:                 email,
-      name:                   profile.name || profile.given_name || email,
+      userId: email,
+      name:   profile.name || profile.given_name || email,
       email,
-      picture:                profile.picture || null,
-      role:                   found.role,
-      encryptedGoogleToken:   tokenStore.encrypt(googleAccessToken),
-      googleTokenExpiresAt:   Date.now() + 55 * 60 * 1000,
+      picture: profile.picture || null,
+      role:   found.role,
     }
     const token = jwt.sign(payload, process.env.JWT_SECRET, {
       expiresIn: process.env.JWT_EXPIRES_IN || '1y',
@@ -80,58 +73,20 @@ router.post('/verify', async (req, res) => {
 
 // ── GET /api/auth/me ─────────────────────────────────────────────────
 router.get('/me', requireAuth, (req, res) => {
-  res.json({ user: req.user, googleExpiringSoon: tokenStore.isExpiringSoon(req.user.userId, req) })
+  res.json({ user: req.user })
 })
 
 // ── POST /api/auth/logout ────────────────────────────────────────────
 router.post('/logout', requireAuth, (req, res) => {
-  tokenStore.delete(req.user.userId)
   res.json({ success: true })
-})
-
-// ── POST /api/auth/refresh-google ───────────────────────────────────
-router.post('/refresh-google', requireAuth, async (req, res) => {
-  const { googleAccessToken } = req.body
-  if (!googleAccessToken) return res.status(400).json({ error: 'googleAccessToken is required' })
-  try {
-    const gRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-      headers: { Authorization: `Bearer ${googleAccessToken}` },
-    })
-    if (!gRes.ok) return res.status(401).json({ error: 'Invalid Google token' })
-    const profile = await gRes.json()
-    const email   = (profile.email || '').toLowerCase().trim()
-    if (email !== req.user.userId) return res.status(403).json({ error: 'Token belongs to a different account' })
-    tokenStore.set(email, googleAccessToken)
-    if (req.user.role === 'admin') setAdminEmail(email)
-
-    // Re-issue the JWT with the freshly encrypted Google token
-    const payload = {
-      ...req.user,
-      encryptedGoogleToken: tokenStore.encrypt(googleAccessToken),
-      googleTokenExpiresAt: Date.now() + 55 * 60 * 1000,
-    }
-    delete payload.iat
-    delete payload.exp
-    const newJwt = jwt.sign(payload, process.env.JWT_SECRET, {
-      expiresIn: process.env.JWT_EXPIRES_IN || '1y',
-    })
-    res.json({ success: true, token: newJwt })
-  } catch (err) {
-    console.error('[auth/refresh-google]', err)
-    res.status(500).json({ error: 'Failed to refresh token' })
-  }
 })
 
 // ── GET /api/auth/users ──────────────────────────────────────────────
 router.get('/users', requireAuth, async (req, res) => {
   if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Admin only' })
 
-  // Ensure this admin's token is registered as the active one
-  const myToken = tokenStore.get(req.user.userId)
-  if (myToken) setAdminEmail(req.user.userId)
-
-  // If no admin token available yet (cold start before any admin logged in)
-  if (!isReady()) {
+  // If no token available yet (cold start, no service account)
+  if (!(await isReady())) {
     const users = BOOTSTRAP_ADMINS.map(e => ({ email: e, role: 'admin', addedBy: 'env', addedAt: '' }))
     return res.json({ users, sheetId: null, sheetReady: false })
   }
@@ -149,9 +104,6 @@ router.get('/users', requireAuth, async (req, res) => {
 // ── POST /api/auth/users ─────────────────────────────────────────────
 router.post('/users', requireAuth, async (req, res) => {
   if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Admin only' })
-
-  const myToken = tokenStore.get(req.user.userId)
-  if (myToken) setAdminEmail(req.user.userId)
 
   const { email, role } = req.body
   if (!email || !role) return res.status(400).json({ error: 'email and role are required' })
@@ -188,9 +140,6 @@ router.put('/users/:rowIndex', requireAuth, async (req, res) => {
   if (!role || !['admin', 'user'].includes(role)) return res.status(400).json({ error: 'Valid role required' })
   if (isNaN(rowNum) || rowNum < 2) return res.status(400).json({ error: 'Invalid rowIndex' })
 
-  const myToken = tokenStore.get(req.user.userId)
-  if (myToken) setAdminEmail(req.user.userId)
-
   try {
     await updateUserRole(rowNum, role)
     await refreshCache()
@@ -209,9 +158,6 @@ router.delete('/users/:rowIndex', requireAuth, async (req, res) => {
   const sheetId = parseInt(req.query.sheetId)
   if (isNaN(rowNum) || rowNum < 2) return res.status(400).json({ error: 'Invalid rowIndex' })
   if (isNaN(sheetId)) return res.status(400).json({ error: 'sheetId query param required' })
-
-  const myToken = tokenStore.get(req.user.userId)
-  if (myToken) setAdminEmail(req.user.userId)
 
   try {
     await removeUser(rowNum, sheetId)

@@ -6,8 +6,8 @@
 
 import { Router }     from 'express'
 import fetch          from 'node-fetch'
-import { tokenStore } from '../config/tokenStore.js'
 import { requireAuth } from '../middleware/auth.js'
+import { getServiceToken } from '../config/serviceAccount.js'
 
 const router = Router()
 
@@ -24,10 +24,14 @@ function colIndexToLetter(index) {
   return letter
 }
 
-// ── Helper: get Google token or return 401 ──────────────────────────
-// Passes req so tokenStore can decrypt the token from the JWT payload
-// rather than relying on the in-memory Map (which dies on cold starts).
-function getGoogleToken(req, res) {
+// ── Helper: get a valid Google token (service account preferred) ─────
+async function getGoogleToken(req, res) {
+  // Primary: service account token (never expires, auto-refreshes)
+  const saToken = await getServiceToken()
+  if (saToken) return saToken
+
+  // Fallback: user's OAuth token from JWT (expires after ~60 min)
+  const { tokenStore } = await import('../config/tokenStore.js')
   const token = tokenStore.get(req.user.userId, req)
   if (!token) {
     res.status(401).json({
@@ -44,7 +48,10 @@ async function handleGoogleError(googleRes, res) {
   const body = await googleRes.json().catch(() => ({}))
   const msg  = body?.error?.message || `Google API error ${googleRes.status}`
   console.error('[sheets] Google error:', msg)
-  return res.status(googleRes.status).json({ error: msg })
+  // If Google returns 401, include GOOGLE_TOKEN_EXPIRED code so the
+  // frontend can silently refresh the token and retry the request.
+  const extra = googleRes.status === 401 ? { code: 'GOOGLE_TOKEN_EXPIRED' } : {}
+  return res.status(googleRes.status).json({ error: msg, ...extra })
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -52,7 +59,7 @@ async function handleGoogleError(googleRes, res) {
 // Returns all rows from the first sheet tab.
 // ─────────────────────────────────────────────────────────────────────
 router.get('/data', requireAuth, async (req, res) => {
-  const googleToken = getGoogleToken(req, res)
+  const googleToken = await getGoogleToken(req, res)
   if (!googleToken) return
 
   try {
@@ -93,7 +100,7 @@ router.get('/data', requireAuth, async (req, res) => {
 // Body: { values: [...], sheetName: "Sheet1" }
 // ─────────────────────────────────────────────────────────────────────
 router.post('/append', requireAuth, async (req, res) => {
-  const googleToken = getGoogleToken(req, res)
+  const googleToken = await getGoogleToken(req, res)
   if (!googleToken) return
 
   const { values, sheetName } = req.body
@@ -142,7 +149,7 @@ router.post('/append', requireAuth, async (req, res) => {
 // Body: { values: [...], sheetName: "Sheet1" }
 // ─────────────────────────────────────────────────────────────────────
 router.put('/row/:rowIndex', requireAuth, async (req, res) => {
-  const googleToken = getGoogleToken(req, res)
+  const googleToken = await getGoogleToken(req, res)
   if (!googleToken) return
 
   const { rowIndex } = req.params
@@ -195,7 +202,7 @@ router.put('/row/:rowIndex', requireAuth, async (req, res) => {
 // Query: ?sheetId=0
 // ─────────────────────────────────────────────────────────────────────
 router.delete('/row/:rowIndex', requireAuth, async (req, res) => {
-  const googleToken = getGoogleToken(req, res)
+  const googleToken = await getGoogleToken(req, res)
   if (!googleToken) return
 
   const { rowIndex } = req.params
@@ -244,7 +251,7 @@ router.delete('/row/:rowIndex', requireAuth, async (req, res) => {
 // Returns: { created: true/false, sheetId, tabName }
 // ─────────────────────────────────────────────────────────────────────
 router.post('/ensure-tab', requireAuth, async (req, res) => {
-  const googleToken = getGoogleToken(req, res)
+  const googleToken = await getGoogleToken(req, res)
   if (!googleToken) return
 
   const { tabName, headers } = req.body
@@ -306,7 +313,7 @@ router.post('/ensure-tab', requireAuth, async (req, res) => {
 // Returns all rows (including header) from the specified tab.
 // ─────────────────────────────────────────────────────────────────────
 router.get('/tab-data', requireAuth, async (req, res) => {
-  const googleToken = getGoogleToken(req, res)
+  const googleToken = await getGoogleToken(req, res)
   if (!googleToken) return
 
   const { tabName } = req.query

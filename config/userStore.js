@@ -13,12 +13,13 @@
 // Sheet tab "المستخدمون" columns: email | role | addedBy | addedAt
 
 import { tokenStore } from './tokenStore.js'
+import { getServiceToken } from './serviceAccount.js'
 
 const USERS_TAB     = 'المستخدمون'
 const USERS_HEADERS = ['email', 'role', 'addedBy', 'addedAt']
 const SHEET_ID      = () => process.env.SHEET_ID
 
-// Most recent admin email — used to pull their token from tokenStore
+// Most recent admin email — used to pull their token from tokenStore (fallback only)
 let adminEmail = null
 
 /** Called by auth.js whenever an admin logs in or refreshes their Google token. */
@@ -26,11 +27,16 @@ export function setAdminEmail(email) {
   adminEmail = email
 }
 
-// ── Sheet fetch using the stored admin token ──────────────────────────
+// ── Sheet fetch — service account preferred, admin token fallback ─────
 async function sheetFetch(url, options = {}) {
-  // Get the freshest available admin token
-  const token = adminEmail ? tokenStore.get(adminEmail) : null
-  if (!token) throw new Error('لا يوجد مشرف مسجل دخوله حالياً. سجّل دخولك مرة أخرى.')
+  // Primary: service account token (never expires, auto-refreshes)
+  let token = await getServiceToken()
+
+  // Fallback: admin's OAuth token (expires after ~60 min)
+  if (!token) {
+    token = adminEmail ? tokenStore.get(adminEmail) : null
+    if (!token) throw new Error('لا يوجد مشرف مسجل دخوله حالياً. سجّل دخولك مرة أخرى.')
+  }
 
   const res = await fetch(url, {
     ...options,
@@ -43,7 +49,6 @@ async function sheetFetch(url, options = {}) {
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
-    // Token expired → clear it so next call triggers a proper error message
     if (res.status === 401) adminEmail = null
     throw new Error(body?.error?.message || `Sheets API error ${res.status}`)
   }
@@ -110,9 +115,8 @@ export async function lookupUser(email) {
     .split(',').map(x => x.trim().toLowerCase()).filter(Boolean)
   if (bootstrapUsers.includes(e)) return { email: e, role: 'user' }
 
-  // Need an admin token to read the sheet
-  if (!adminEmail || !tokenStore.get(adminEmail)) {
-    // No admin logged in yet — only bootstrap admins can log in
+  // Need a valid token (service account or admin) to read the sheet
+  if (!(await isReady())) {
     return null
   }
 
@@ -179,7 +183,9 @@ export async function getUsersTabSheetId() {
   return tab ? tab.properties.sheetId : null
 }
 
-/** True if we have a live admin token ready. */
-export function isReady() {
+/** True if we have a valid token to access sheets (service account or admin). */
+export async function isReady() {
+  const saToken = await getServiceToken()
+  if (saToken) return true
   return !!(adminEmail && tokenStore.get(adminEmail))
 }

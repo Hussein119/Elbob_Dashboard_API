@@ -68,10 +68,10 @@ router.post('/verify', async (req, res) => {
       googleTokenExpiresAt:   Date.now() + 55 * 60 * 1000,
     }
     const token = jwt.sign(payload, process.env.JWT_SECRET, {
-      expiresIn: process.env.JWT_EXPIRES_IN || '8h',
+      expiresIn: process.env.JWT_EXPIRES_IN || '1y',
     })
 
-    return res.json({ token, user: payload, tokenExpiresIn: process.env.JWT_EXPIRES_IN || '8h' })
+    return res.json({ token, user: payload })
   } catch (err) {
     console.error('[auth/verify]', err)
     return res.status(500).json({ error: 'Authentication failed. Please try again.' })
@@ -113,7 +113,7 @@ router.post('/refresh-google', requireAuth, async (req, res) => {
     delete payload.iat
     delete payload.exp
     const newJwt = jwt.sign(payload, process.env.JWT_SECRET, {
-      expiresIn: process.env.JWT_EXPIRES_IN || '8h',
+      expiresIn: process.env.JWT_EXPIRES_IN || '1y',
     })
     res.json({ success: true, token: newJwt })
   } catch (err) {

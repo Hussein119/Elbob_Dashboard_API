@@ -52,19 +52,31 @@ router.post('/verify', async (req, res) => {
     // 4. If admin, register their email
     if (found.role === 'admin') setAdminEmail(email)
 
-    // 5. Issue JWT — identity only, no Google token embedded
+    // 5. Store token in memory cache (best-effort for same warm instance)
+    const { tokenStore } = await import('../config/tokenStore.js')
+    tokenStore.set(email, googleAccessToken)
+
+    // 6. Issue JWT — embed encrypted Google token so backend survives cold starts.
+    //    AES-256-GCM encrypted — client sees only a base64 blob, not the actual token.
+    const encryptedGoogleToken = tokenStore.encrypt(googleAccessToken)
+    const googleTokenExpiresAt = Date.now() + 55 * 60 * 1000  // 55 min from now
+
     const payload = {
       userId: email,
       name:   profile.name || profile.given_name || email,
       email,
       picture: profile.picture || null,
       role:   found.role,
+      encryptedGoogleToken,
+      googleTokenExpiresAt,
     }
     const token = jwt.sign(payload, process.env.JWT_SECRET, {
       expiresIn: process.env.JWT_EXPIRES_IN || '1y',
     })
 
-    return res.json({ token, user: payload })
+    // Return user WITHOUT encryptedGoogleToken — that stays server-side only
+    const publicUser = { userId: payload.userId, name: payload.name, email: payload.email, picture: payload.picture, role: payload.role }
+    return res.json({ token, user: publicUser })
   } catch (err) {
     console.error('[auth/verify]', err)
     return res.status(500).json({ error: 'Authentication failed. Please try again.' })

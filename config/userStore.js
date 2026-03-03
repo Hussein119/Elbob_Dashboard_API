@@ -17,7 +17,14 @@ import { getServiceToken } from './serviceAccount.js'
 
 const USERS_TAB     = 'المستخدمون'
 const USERS_HEADERS = ['email', 'role', 'addedBy', 'addedAt']
-const SHEET_ID      = () => process.env.SHEET_ID
+// Read once at module load — env vars are immutable after startup.
+const SHEET_ID      = process.env.SHEET_ID
+
+// Parse bootstrap env arrays once; avoids split/map/filter on every request.
+const _bootstrapAdmins = (process.env.ADMIN_EMAILS || '')
+  .split(',').map(e => e.trim().toLowerCase()).filter(Boolean)
+const _bootstrapUsers  = (process.env.USER_EMAILS  || '')
+  .split(',').map(e => e.trim().toLowerCase()).filter(Boolean)
 
 // Most recent admin email — used to pull their token from tokenStore (fallback only)
 let adminEmail = null
@@ -56,26 +63,40 @@ async function sheetFetch(url, options = {}) {
 }
 
 // ── Tab management ────────────────────────────────────────────────────
-async function ensureTab() {
-  const meta = await sheetFetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID()}?fields=sheets.properties`
-  )
-  const exists = (meta.sheets || []).some(s => s.properties.title === USERS_TAB)
-  if (exists) return
+// Once we confirm the tab exists (or create it) we set this flag so
+// subsequent addUser() calls skip the redundant metadata round-trip.
+let _tabEnsured = false
+let _cachedTabSheetId = undefined  // undefined = not fetched; null = tab missing
 
-  await sheetFetch(`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID()}:batchUpdate`, {
+async function ensureTab() {
+  if (_tabEnsured) return  // skip network call after first successful check
+
+  const meta = await sheetFetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}?fields=sheets.properties`
+  )
+  const existing = (meta.sheets || []).find(s => s.properties.title === USERS_TAB)
+  if (existing) {
+    _cachedTabSheetId = existing.properties.sheetId
+    _tabEnsured = true
+    return
+  }
+
+  await sheetFetch(`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}:batchUpdate`, {
     method: 'POST',
     body: JSON.stringify({ requests: [{ addSheet: { properties: { title: USERS_TAB } } }] }),
   })
   await sheetFetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID()}/values/${encodeURIComponent(USERS_TAB + '!A1')}?valueInputOption=USER_ENTERED`,
+    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(USERS_TAB + '!A1')}?valueInputOption=USER_ENTERED`,
     { method: 'PUT', body: JSON.stringify({ values: [USERS_HEADERS] }) }
   )
+  // Invalidate cached sheet ID so getUsersTabSheetId() re-fetches the new tab's ID
+  _cachedTabSheetId = undefined
+  _tabEnsured = true
 }
 
 async function readAllRows() {
   const data = await sheetFetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID()}/values/${encodeURIComponent(USERS_TAB + '!A:D')}`
+    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(USERS_TAB + '!A:D')}`
   )
   if (!data?.values || data.values.length < 2) return []
   return data.values.slice(1).map((row, i) => ({
@@ -106,14 +127,10 @@ export async function refreshCache() {
 export async function lookupUser(email) {
   const e = email.toLowerCase().trim()
 
-  const bootstrapAdmins = (process.env.ADMIN_EMAILS || '')
-    .split(',').map(x => x.trim().toLowerCase()).filter(Boolean)
-  if (bootstrapAdmins.includes(e)) return { email: e, role: 'admin' }
+  if (_bootstrapAdmins.includes(e)) return { email: e, role: 'admin' }
 
   // Bootstrap users — defined in USER_EMAILS env var, always have role 'user'
-  const bootstrapUsers = (process.env.USER_EMAILS || '')
-    .split(',').map(x => x.trim().toLowerCase()).filter(Boolean)
-  if (bootstrapUsers.includes(e)) return { email: e, role: 'user' }
+  if (_bootstrapUsers.includes(e)) return { email: e, role: 'user' }
 
   // Need a valid token (service account or admin) to read the sheet
   if (!(await isReady())) {
@@ -127,17 +144,13 @@ export async function lookupUser(email) {
 export async function getAllUsers() {
   if (!cache || Date.now() - cacheTime > TTL_MS) await refreshCache()
 
-  const bootstrapAdmins = (process.env.ADMIN_EMAILS || '')
-    .split(',').map(x => x.trim().toLowerCase()).filter(Boolean)
-  const bootstrapUsers = (process.env.USER_EMAILS || '')
-    .split(',').map(x => x.trim().toLowerCase()).filter(Boolean)
   const sheetUsers  = cache ? [...cache.values()] : []
   const sheetEmails = new Set(sheetUsers.map(u => u.email))
-  const envAdmins   = bootstrapAdmins
+  const envAdmins   = _bootstrapAdmins
     .filter(e => !sheetEmails.has(e))
     .map(e => ({ email: e, role: 'admin', addedBy: 'env', addedAt: '' }))
-  const envUsers    = bootstrapUsers
-    .filter(e => !sheetEmails.has(e) && !bootstrapAdmins.includes(e))
+  const envUsers    = _bootstrapUsers
+    .filter(e => !sheetEmails.has(e) && !_bootstrapAdmins.includes(e))
     .map(e => ({ email: e, role: 'user', addedBy: 'env', addedAt: '' }))
   const envOnly = [...envAdmins, ...envUsers]
 
@@ -149,14 +162,14 @@ export async function addUser(email, role, addedBy) {
   await ensureTab()
   const now = new Date().toLocaleDateString('ar-EG')
   await sheetFetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID()}/values/${encodeURIComponent(USERS_TAB + '!A:D')}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
+    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(USERS_TAB + '!A:D')}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
     { method: 'POST', body: JSON.stringify({ values: [[e, role, addedBy, now]] }) }
   )
   cache = null
 }
 
 export async function removeUser(rowIndex, tabSheetId) {
-  await sheetFetch(`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID()}:batchUpdate`, {
+  await sheetFetch(`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}:batchUpdate`, {
     method: 'POST',
     body: JSON.stringify({
       requests: [{ deleteDimension: {
@@ -169,18 +182,21 @@ export async function removeUser(rowIndex, tabSheetId) {
 
 export async function updateUserRole(rowIndex, role) {
   await sheetFetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID()}/values/${encodeURIComponent(USERS_TAB + '!B' + rowIndex)}?valueInputOption=USER_ENTERED`,
+    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(USERS_TAB + '!B' + rowIndex)}?valueInputOption=USER_ENTERED`,
     { method: 'PUT', body: JSON.stringify({ values: [[role]] }) }
   )
   cache = null
 }
 
 export async function getUsersTabSheetId() {
+  // Return cached value — the tab's numeric sheetId never changes once created.
+  if (_cachedTabSheetId !== undefined) return _cachedTabSheetId
   const meta = await sheetFetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID()}?fields=sheets.properties`
+    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}?fields=sheets.properties`
   )
   const tab = (meta.sheets || []).find(s => s.properties.title === USERS_TAB)
-  return tab ? tab.properties.sheetId : null
+  _cachedTabSheetId = tab ? tab.properties.sheetId : null
+  return _cachedTabSheetId
 }
 
 /** True if we have a valid token to access sheets (service account or admin). */

@@ -31,13 +31,11 @@
 import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'crypto'
 
 // ── Derive a 32-byte AES key from JWT_SECRET ─────────────────────────
-// Reuses the existing env var — no new secret needed.
-// SHA-256 turns any-length string into exactly 32 bytes for AES-256.
-function getKey() {
-  return createHash('sha256')
-    .update(process.env.JWT_SECRET || 'fallback-secret-change-me')
-    .digest()
-}
+// Computed ONCE at module load. JWT_SECRET is immutable after startup,
+// so re-hashing on every encrypt/decrypt call wastes CPU on every request.
+const _aesKey = createHash('sha256')
+  .update(process.env.JWT_SECRET || 'fallback-secret-change-me')
+  .digest()
 
 const ALGORITHM = 'aes-256-gcm'
 const IV_BYTES  = 12  // 96-bit IV — recommended for GCM
@@ -51,7 +49,7 @@ const TAG_BYTES = 16  // GCM auth tag
  */
 function encryptToken(plaintext) {
   const iv     = randomBytes(IV_BYTES)
-  const cipher = createCipheriv(ALGORITHM, getKey(), iv)
+  const cipher = createCipheriv(ALGORITHM, _aesKey, iv)
   const enc    = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()])
   const tag    = cipher.getAuthTag()
   return Buffer.concat([iv, tag, enc]).toString('base64url')
@@ -67,7 +65,7 @@ function decryptToken(blob) {
     const iv         = buf.subarray(0, IV_BYTES)
     const tag        = buf.subarray(IV_BYTES, IV_BYTES + TAG_BYTES)
     const ciphertext = buf.subarray(IV_BYTES + TAG_BYTES)
-    const decipher   = createDecipheriv(ALGORITHM, getKey(), iv)
+    const decipher   = createDecipheriv(ALGORITHM, _aesKey, iv)
     decipher.setAuthTag(tag)
     return decipher.update(ciphertext) + decipher.final('utf8')
   } catch {
@@ -84,6 +82,15 @@ const GOOGLE_TOKEN_TTL_MS = 55 * 60 * 1000
 // userStore.js needs the admin token between requests; this helps there.
 // It is NOT relied on for correctness across cold starts.
 const _mem = new Map()
+
+// Evict expired entries every 10 minutes to prevent unbounded memory growth
+// when many users log in over time. .unref() lets the process exit cleanly.
+setInterval(() => {
+  const now = Date.now()
+  for (const [k, v] of _mem) {
+    if (now > v.expiresAt) _mem.delete(k)
+  }
+}, 10 * 60 * 1000).unref()
 
 // ── Public tokenStore object ──────────────────────────────────────────
 export const tokenStore = {

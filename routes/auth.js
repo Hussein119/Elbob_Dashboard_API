@@ -4,6 +4,7 @@ import { Router }      from 'express'
 import jwt             from 'jsonwebtoken'
 import fetch           from 'node-fetch'
 import { requireAuth } from '../middleware/auth.js'
+import { tokenStore }  from '../config/tokenStore.js'
 import {
   setAdminEmail, lookupUser, getAllUsers, addUser,
   removeUser, updateUserRole, getUsersTabSheetId,
@@ -14,6 +15,10 @@ const router = Router()
 
 const BOOTSTRAP_ADMINS = (process.env.ADMIN_EMAILS || '')
   .split(',').map(e => e.trim().toLowerCase()).filter(Boolean)
+
+// Parsed once at module load so POST /users doesn't re-parse on every request.
+const BOOTSTRAP_USERS = (process.env.USER_EMAILS || '')
+  .split(',').map(x => x.trim().toLowerCase()).filter(Boolean)
 
 // ── POST /api/auth/verify ────────────────────────────────────────────
 router.post('/verify', async (req, res) => {
@@ -53,7 +58,6 @@ router.post('/verify', async (req, res) => {
     if (found.role === 'admin') setAdminEmail(email)
 
     // 5. Store token in memory cache (best-effort for same warm instance)
-    const { tokenStore } = await import('../config/tokenStore.js')
     tokenStore.set(email, googleAccessToken)
 
     // 6. Issue JWT — embed encrypted Google token so backend survives cold starts.
@@ -125,8 +129,6 @@ router.post('/users', requireAuth, async (req, res) => {
   if (BOOTSTRAP_ADMINS.includes(e))
     return res.status(400).json({ error: 'هذا المستخدم موجود بالفعل كمشرف في إعدادات الخادم' })
 
-  const BOOTSTRAP_USERS = (process.env.USER_EMAILS || '')
-    .split(',').map(x => x.trim().toLowerCase()).filter(Boolean)
   if (BOOTSTRAP_USERS.includes(e))
     return res.status(400).json({ error: 'هذا المستخدم موجود بالفعل كمستخدم في إعدادات الخادم' })
 

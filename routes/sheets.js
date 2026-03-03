@@ -4,10 +4,11 @@
 // The frontend NEVER talks to Google directly — it talks to us.
 // We retrieve the Google token from the server-side store and attach it.
 
-import { Router }     from 'express'
-import fetch          from 'node-fetch'
-import { requireAuth } from '../middleware/auth.js'
+import { Router }          from 'express'
+import fetch               from 'node-fetch'
+import { requireAuth }     from '../middleware/auth.js'
 import { getServiceToken } from '../config/serviceAccount.js'
+import { tokenStore }      from '../config/tokenStore.js'
 
 const router = Router()
 
@@ -31,7 +32,6 @@ async function getGoogleToken(req, res) {
   if (saToken) return saToken
 
   // Fallback: user's OAuth token from JWT (expires after ~60 min)
-  const { tokenStore } = await import('../config/tokenStore.js')
   const token = tokenStore.get(req.user.userId, req)
   if (!token) {
     res.status(401).json({
@@ -109,18 +109,9 @@ router.post('/append', requireAuth, async (req, res) => {
   }
 
   try {
-    // Find the actual last row (including empty rows) to append after it
-    const metaUrl = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}?fields=sheets(properties(title,sheetId,gridProperties(rowCount)))`
-    const metaRes = await fetch(metaUrl, {
-      headers: { Authorization: `Bearer ${googleToken}` },
-    })
-    if (!metaRes.ok) return handleGoogleError(metaRes, res)
-    const meta = await metaRes.json()
-    const sheet = meta.sheets?.find(s => s.properties.title === sheetName)
-    const totalRows = sheet?.properties?.gridProperties?.rowCount || 1000
-
-    // Read all rows to find the last non-empty row
-    const dataUrl = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName + '!A1:A' + totalRows)}`
+    // Read column A directly — no prior metadata fetch needed to determine
+    // row count because A:A returns all rows without an explicit bound.
+    const dataUrl = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName + '!A:A')}`
     const dataRes = await fetch(dataUrl, {
       headers: { Authorization: `Bearer ${googleToken}` },
     })

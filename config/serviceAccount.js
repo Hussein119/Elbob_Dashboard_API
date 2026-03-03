@@ -22,10 +22,15 @@ const SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 let cachedToken    = null
 let tokenExpiresAt = 0
 
+// Cache the parsed service account JSON — JSON.parse() runs once instead of
+// on every getServiceToken() / getServiceAccountEmail() call.
+let _cachedServiceKey = undefined  // undefined = not yet attempted; null = not configured
 function getKey() {
+  if (_cachedServiceKey !== undefined) return _cachedServiceKey
   const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY
-  if (!raw) return null
-  try { return JSON.parse(raw) } catch { return null }
+  if (!raw) { _cachedServiceKey = null; return null }
+  try { _cachedServiceKey = JSON.parse(raw) } catch { _cachedServiceKey = null }
+  return _cachedServiceKey
 }
 
 /** Create a signed JWT for the service account and exchange it for an access token. */

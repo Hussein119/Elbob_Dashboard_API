@@ -263,8 +263,31 @@ router.post('/ensure-tab', requireAuth, async (req, res) => {
     const existing = sheets.find(s => s.properties.title === tabName)
 
     if (existing) {
-      // Tab already exists — return its id
-      return res.json({ created: false, sheetId: existing.properties.sheetId, tabName })
+      const sheetId = existing.properties.sheetId
+
+      // Read current header row to check for missing columns
+      const readUrl = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(tabName + '!1:1')}`
+      const readRes = await fetch(readUrl, { headers: { Authorization: `Bearer ${googleToken}` } })
+      if (!readRes.ok) return handleGoogleError(readRes, res)
+      const readData   = await readRes.json()
+      const currentRow = readData.values?.[0] || []
+
+      const missing = headers.filter(h => !currentRow.includes(h))
+      if (missing.length > 0) {
+        // Append missing headers to the end of row 1
+        const nextCol  = colIndexToLetter(currentRow.length + 1)
+        const lastCol  = colIndexToLetter(currentRow.length + missing.length)
+        const range    = `${tabName}!${nextCol}1:${lastCol}1`
+        const writeUrl = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(range)}?valueInputOption=USER_ENTERED`
+        const writeRes = await fetch(writeUrl, {
+          method:  'PUT',
+          headers: { Authorization: `Bearer ${googleToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ values: [missing] }),
+        })
+        if (!writeRes.ok) return handleGoogleError(writeRes, res)
+      }
+
+      return res.json({ created: false, sheetId, tabName })
     }
 
     // 2. Create the new tab

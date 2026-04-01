@@ -109,21 +109,13 @@ router.post('/append', requireAuth, async (req, res) => {
   }
 
   try {
-    // Read column A directly — no prior metadata fetch needed to determine
-    // row count because A:A returns all rows without an explicit bound.
-    const dataUrl = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(sheetName + '!A:A')}`
-    const dataRes = await fetch(dataUrl, {
-      headers: { Authorization: `Bearer ${googleToken}` },
-    })
-    if (!dataRes.ok) return handleGoogleError(dataRes, res)
-    const dataBody = await dataRes.json()
-    const lastRow = (dataBody.values?.length || 0) + 1
-
-    // Write directly to the row after the last one
-    const range = encodeURIComponent(`${sheetName}!A${lastRow}`)
-    const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${range}?valueInputOption=USER_ENTERED`
+    // Use the Sheets API native append endpoint — it locates the first empty
+    // row automatically and inserts new rows into the grid if the sheet is
+    // full, avoiding "exceeds grid limits" errors from manual row calculation.
+    const range = encodeURIComponent(`${sheetName}!A1`)
+    const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${range}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`
     const gRes = await fetch(url, {
-      method:  'PUT',
+      method:  'POST',
       headers: { Authorization: `Bearer ${googleToken}`, 'Content-Type': 'application/json' },
       body:    JSON.stringify({ values }),
     })

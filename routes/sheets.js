@@ -340,4 +340,49 @@ router.get('/tab-data', requireAuth, async (req, res) => {
   }
 })
 
+// ─────────────────────────────────────────────────────────────────────
+// POST /api/sheets/batch-rows
+// Body: { sheetName, updates: [{ rowIndex, values: [...] }] }
+// Updates multiple rows in a single Google Sheets batchUpdate call.
+// ─────────────────────────────────────────────────────────────────────
+router.post('/batch-rows', requireAuth, async (req, res) => {
+  const googleToken = await getGoogleToken(req, res)
+  if (!googleToken) return
+
+  const { sheetName, updates } = req.body
+  if (!sheetName || !Array.isArray(updates) || updates.length === 0) {
+    return res.status(400).json({ error: 'sheetName and updates[] are required' })
+  }
+
+  for (const u of updates) {
+    const row = parseInt(u.rowIndex, 10)
+    if (isNaN(row) || row < 2) {
+      return res.status(400).json({ error: `Invalid rowIndex: ${u.rowIndex}` })
+    }
+    if (!Array.isArray(u.values)) {
+      return res.status(400).json({ error: 'Each update must have a values array' })
+    }
+  }
+
+  try {
+    const url  = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values:batchUpdate`
+    const gRes = await fetch(url, {
+      method:  'POST',
+      headers: { Authorization: `Bearer ${googleToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        valueInputOption: 'USER_ENTERED',
+        data: updates.map(({ rowIndex, values }) => ({
+          range:  `${sheetName}!A${rowIndex}`,
+          values: [values],
+        })),
+      }),
+    })
+    if (!gRes.ok) return handleGoogleError(gRes, res)
+    res.json({ updated: updates.length })
+  } catch (err) {
+    console.error('[sheets/batch-rows]', err)
+    res.status(500).json({ error: 'Failed to batch update rows' })
+  }
+})
+
 export default router

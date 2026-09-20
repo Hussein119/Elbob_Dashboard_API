@@ -56,3 +56,9 @@ node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"
 2. Set all env vars in your hosting dashboard
 3. Set `ALLOWED_ORIGINS` to your Vercel frontend URL
 4. Set `VITE_API_URL` in your Vercel frontend env to the backend URL
+
+## Config in : 
+
+```
+console.cloud.google.com
+```

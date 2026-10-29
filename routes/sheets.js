@@ -55,8 +55,9 @@ async function handleGoogleError(googleRes, res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// GET /api/sheets/data
-// Returns all rows from the first sheet tab.
+// GET /api/sheets/data?tabName=...
+// Returns all rows from the named tab, or from the first tab when
+// tabName is omitted or doesn't exist.
 // ─────────────────────────────────────────────────────────────────────
 router.get('/data', requireAuth, async (req, res) => {
   const googleToken = await getGoogleToken(req, res)
@@ -70,10 +71,11 @@ router.get('/data', requireAuth, async (req, res) => {
     )
     if (!metaRes.ok) return handleGoogleError(metaRes, res)
 
-    const meta       = await metaRes.json()
-    const firstSheet = meta.sheets[0].properties
-    const sheetName  = firstSheet.title
-    const sheetId    = firstSheet.sheetId
+    const meta      = await metaRes.json()
+    const { tabName } = req.query
+    const target    = (tabName && meta.sheets.find(s => s.properties.title === tabName)) || meta.sheets[0]
+    const sheetName = target.properties.title
+    const sheetId   = target.properties.sheetId
 
     // Step 2: fetch values
     const valRes = await fetch(

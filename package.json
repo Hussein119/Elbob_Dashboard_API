@@ -9,6 +9,11 @@
     "dev": "node --env-file=.env --watch api/index.js",
     "archive": "node --env-file=.env scripts/archive.js"
   },
+  "author": {
+    "name": "Hussein AbdElkader",
+    "email": "dev.hussein.abdelkader@gmail.com",
+    "linkedin": "https://www.linkedin.com/in/husseinabdelkader/"
+  },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",

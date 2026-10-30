@@ -1,31 +1,41 @@
 // middleware/auth.js
-// Verifies our own JWT on every protected route.
-// The Google access token lives only on the server — never sent to the client.
+// Verifies our own JWT on every protected route, then re-checks the user
+// against the users list so removals / role changes apply immediately instead
+// of when the (long-lived) JWT expires.
 
 import jwt from 'jsonwebtoken'
+import { HttpError, asyncHandler } from './errors.js'
+import { getCurrentRole } from '../config/userStore.js'
 
-export function requireAuth(req, res, next) {
+export const requireAuth = asyncHandler(async (req, _res, next) => {
   const authHeader = req.headers.authorization
   if (!authHeader?.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Missing or malformed Authorization header' })
+    throw new HttpError(401, 'Missing or malformed Authorization header', 'NO_TOKEN')
   }
 
-  const token = authHeader.slice(7)
+  let payload
   try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET)
-    req.user = payload          // { userId, name, email, role, iat, exp }
-    next()
+    payload = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET)
   } catch (err) {
     if (err.name === 'TokenExpiredError') {
-      return res.status(401).json({ error: 'Session expired. Please log in again.', code: 'TOKEN_EXPIRED' })
+      throw new HttpError(401, 'Session expired. Please log in again.', 'TOKEN_EXPIRED')
     }
-    return res.status(401).json({ error: 'Invalid token' })
+    throw new HttpError(401, 'Invalid token', 'INVALID_TOKEN')
   }
-}
 
-export function requireAdmin(req, res, next) {
+  // null = no longer in the users list; undefined = list unreachable, keep the JWT role
+  const currentRole = await getCurrentRole(payload.email || payload.userId)
+  if (currentRole === null) {
+    throw new HttpError(401, 'تم إلغاء صلاحية دخولك. تواصل مع المدير.', 'USER_REMOVED')
+  }
+
+  req.user = { ...payload, role: currentRole ?? payload.role }  // { userId, name, email, role, iat, exp }
+  next()
+})
+
+export function requireAdmin(req, _res, next) {
   if (req.user?.role !== 'admin') {
-    return res.status(403).json({ error: 'Admin access required' })
+    return next(new HttpError(403, 'Admin access required', 'ADMIN_ONLY'))
   }
   next()
 }

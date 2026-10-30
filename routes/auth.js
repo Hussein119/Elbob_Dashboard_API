@@ -1,14 +1,16 @@
 // routes/auth.js
 
-import { Router }      from 'express'
-import jwt             from 'jsonwebtoken'
-import fetch           from 'node-fetch'
-import { requireAuth } from '../middleware/auth.js'
-import { tokenStore }  from '../config/tokenStore.js'
+import { Router }       from 'express'
+import jwt              from 'jsonwebtoken'
+import { z }            from 'zod'
+import { requireAuth, requireAdmin } from '../middleware/auth.js'
+import { ensureJsonBody } from '../middleware/jsonBody.js'
+import { validate }     from '../middleware/validate.js'
+import { HttpError, asyncHandler } from '../middleware/errors.js'
+import { tokenStore }   from '../config/tokenStore.js'
 import {
   setAdminEmail, lookupUser, getAllUsers, addUser,
-  removeUser, updateUserRole, getUsersTabSheetId,
-  refreshCache, isReady,
+  removeUser, updateUserRole, isReady,
 } from '../config/userStore.js'
 
 const router = Router()
@@ -20,76 +22,77 @@ const BOOTSTRAP_ADMINS = (process.env.ADMIN_EMAILS || '')
 const BOOTSTRAP_USERS = (process.env.USER_EMAILS || '')
   .split(',').map(x => x.trim().toLowerCase()).filter(Boolean)
 
+const email = z.string().trim().toLowerCase().email().max(254)
+const role  = z.enum(['admin', 'user'])
+
+const verifyBody   = z.object({ googleAccessToken: z.string().min(1).max(4096) })
+const addUserBody  = z.object({ email, role })
+const roleBody     = z.object({ role })
+const emailParams  = z.object({ email })
+
+const bootstrapOnlyUsers = () =>
+  BOOTSTRAP_ADMINS.map(e => ({ email: e, role: 'admin', addedBy: 'env', addedAt: '' }))
+
+router.use(ensureJsonBody)
+
 // ── POST /api/auth/verify ────────────────────────────────────────────
-router.post('/verify', async (req, res) => {
-  const { googleAccessToken } = req.body
-  if (!googleAccessToken || typeof googleAccessToken !== 'string')
-    return res.status(400).json({ error: 'googleAccessToken is required' })
+router.post('/verify', validate({ body: verifyBody }), asyncHandler(async (req, res) => {
+  const { googleAccessToken } = req.valid.body
 
+  // 1. Verify with Google
+  const gRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+    headers: { Authorization: `Bearer ${googleAccessToken}` },
+  })
+  if (!gRes.ok) throw new HttpError(401, 'Invalid or expired Google token', 'INVALID_GOOGLE_TOKEN')
+
+  const profile = await gRes.json()
+  const userEmail = (profile.email || '').toLowerCase().trim()
+  if (!userEmail) throw new HttpError(401, 'Could not retrieve email from Google', 'INVALID_GOOGLE_TOKEN')
+
+  // 2. If bootstrap admin → register as the active admin token provider
+  if (BOOTSTRAP_ADMINS.includes(userEmail)) setAdminEmail(userEmail)
+
+  // 3. Look up user (bootstrap env check + sheet check)
+  let found
   try {
-    // 1. Verify with Google
-    const gRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-      headers: { Authorization: `Bearer ${googleAccessToken}` },
-    })
-    if (!gRes.ok) return res.status(401).json({ error: 'Invalid or expired Google token' })
-
-    const profile = await gRes.json()
-    const email   = (profile.email || '').toLowerCase().trim()
-    if (!email) return res.status(401).json({ error: 'Could not retrieve email from Google' })
-
-    // 2. If bootstrap admin → register as the active admin token provider
-    if (BOOTSTRAP_ADMINS.includes(email)) setAdminEmail(email)
-
-    // 3. Look up user (bootstrap env check + sheet check)
-    let found
-    try {
-      found = await lookupUser(email)
-    } catch (e) {
-      console.warn('[auth/verify] lookupUser error:', e.message)
-      // Sheet unreachable — only let bootstrap admins through
-      found = BOOTSTRAP_ADMINS.includes(email) ? { email, role: 'admin' } : null
-    }
-
-    if (!found) {
-      return res.status(403).json({ error: 'غير مصرح لك بالدخول. تواصل مع المدير لإضافتك.' })
-    }
-
-    // 4. If admin, register their email
-    if (found.role === 'admin') setAdminEmail(email)
-
-    // 5. Store token in memory cache (best-effort for same warm instance)
-    tokenStore.set(email, googleAccessToken)
-
-    // 6. Issue JWT — embed encrypted Google token so backend survives cold starts.
-    //    AES-256-GCM encrypted — client sees only a base64 blob, not the actual token.
-    const encryptedGoogleToken = tokenStore.encrypt(googleAccessToken)
-    const googleTokenExpiresAt = Date.now() + 55 * 60 * 1000  // 55 min from now
-
-    const payload = {
-      userId: email,
-      name:   profile.name || profile.given_name || email,
-      email,
-      picture: profile.picture || null,
-      role:   found.role,
-      encryptedGoogleToken,
-      googleTokenExpiresAt,
-    }
-    const token = jwt.sign(payload, process.env.JWT_SECRET, {
-      expiresIn: process.env.JWT_EXPIRES_IN || '1y',
-    })
-
-    // Return user WITHOUT encryptedGoogleToken — that stays server-side only
-    const publicUser = { userId: payload.userId, name: payload.name, email: payload.email, picture: payload.picture, role: payload.role }
-    return res.json({ token, user: publicUser })
-  } catch (err) {
-    console.error('[auth/verify]', err)
-    return res.status(500).json({ error: 'Authentication failed. Please try again.' })
+    found = await lookupUser(userEmail)
+  } catch (e) {
+    console.warn('[auth/verify] lookupUser error:', e.message)
+    // Sheet unreachable — only let bootstrap admins through
+    found = BOOTSTRAP_ADMINS.includes(userEmail) ? { email: userEmail, role: 'admin' } : null
   }
-})
+  if (!found) throw new HttpError(403, 'غير مصرح لك بالدخول. تواصل مع المدير لإضافتك.', 'NOT_ALLOWED')
+
+  // 4. If admin, register their email
+  if (found.role === 'admin') setAdminEmail(userEmail)
+
+  // 5. Store token in memory cache (best-effort for same warm instance)
+  tokenStore.set(userEmail, googleAccessToken)
+
+  // 6. Issue JWT — embed encrypted Google token so backend survives cold starts.
+  //    AES-256-GCM encrypted — client sees only a base64 blob, not the actual token.
+  const payload = {
+    userId:  userEmail,
+    name:    profile.name || profile.given_name || userEmail,
+    email:   userEmail,
+    picture: profile.picture || null,
+    role:    found.role,
+    encryptedGoogleToken: tokenStore.encrypt(googleAccessToken),
+    googleTokenExpiresAt: Date.now() + 55 * 60 * 1000,
+  }
+  const token = jwt.sign(payload, process.env.JWT_SECRET, {
+    expiresIn: process.env.JWT_EXPIRES_IN || '1y',
+  })
+
+  // Return user WITHOUT encryptedGoogleToken — that stays server-side only
+  const { userId, name, picture } = payload
+  res.json({ token, user: { userId, name, email: userEmail, picture, role: found.role } })
+}))
 
 // ── GET /api/auth/me ─────────────────────────────────────────────────
 router.get('/me', requireAuth, (req, res) => {
-  res.json({ user: req.user })
+  const { userId, name, email: userEmail, picture, role: userRole } = req.user
+  res.json({ user: { userId, name, email: userEmail, picture, role: userRole } })
 })
 
 // ── POST /api/auth/logout ────────────────────────────────────────────
@@ -97,91 +100,50 @@ router.post('/logout', requireAuth, (req, res) => {
   res.json({ success: true })
 })
 
-// ── GET /api/auth/users ──────────────────────────────────────────────
-router.get('/users', requireAuth, async (req, res) => {
-  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Admin only' })
+// ── /api/auth/users (admin only) ─────────────────────────────────────
+router.use('/users', requireAuth, requireAdmin)
 
-  // If no token available yet (cold start, no service account)
+router.get('/users', asyncHandler(async (req, res) => {
+  // No token available yet (cold start, no service account)
   if (!(await isReady())) {
-    const users = BOOTSTRAP_ADMINS.map(e => ({ email: e, role: 'admin', addedBy: 'env', addedAt: '' }))
-    return res.json({ users, sheetId: null, sheetReady: false })
+    return res.json({ users: bootstrapOnlyUsers(), sheetReady: false })
   }
-
   try {
-    const [users, sheetId] = await Promise.all([getAllUsers(), getUsersTabSheetId()])
-    res.json({ users, sheetId, sheetReady: true })
+    res.json({ users: await getAllUsers(), sheetReady: true })
   } catch (err) {
     console.error('[auth/users GET]', err)
-    const users = BOOTSTRAP_ADMINS.map(e => ({ email: e, role: 'admin', addedBy: 'env', addedAt: '' }))
-    res.json({ users, sheetId: null, sheetReady: false, error: err.message })
+    res.json({ users: bootstrapOnlyUsers(), sheetReady: false, error: err.message })
   }
-})
+}))
 
-// ── POST /api/auth/users ─────────────────────────────────────────────
-router.post('/users', requireAuth, async (req, res) => {
-  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Admin only' })
+router.post('/users', validate({ body: addUserBody }), asyncHandler(async (req, res) => {
+  const { email: newEmail, role: newRole } = req.valid.body
 
-  const { email, role } = req.body
-  if (!email || !role) return res.status(400).json({ error: 'email and role are required' })
-  if (!['admin', 'user'].includes(role)) return res.status(400).json({ error: 'role must be admin or user' })
+  if (BOOTSTRAP_ADMINS.includes(newEmail))
+    throw new HttpError(400, 'هذا المستخدم موجود بالفعل كمشرف في إعدادات الخادم', 'ENV_USER')
+  if (BOOTSTRAP_USERS.includes(newEmail))
+    throw new HttpError(400, 'هذا المستخدم موجود بالفعل كمستخدم في إعدادات الخادم', 'ENV_USER')
 
-  const e = email.toLowerCase().trim()
-  if (BOOTSTRAP_ADMINS.includes(e))
-    return res.status(400).json({ error: 'هذا المستخدم موجود بالفعل كمشرف في إعدادات الخادم' })
+  const existing = await getAllUsers()
+  if (existing.some(u => u.email === newEmail))
+    throw new HttpError(409, 'المستخدم مضاف بالفعل', 'USER_EXISTS')
 
-  if (BOOTSTRAP_USERS.includes(e))
-    return res.status(400).json({ error: 'هذا المستخدم موجود بالفعل كمستخدم في إعدادات الخادم' })
+  await addUser(newEmail, newRole, req.user.email)
+  res.status(201).json({ success: true, users: await getAllUsers(), sheetReady: true })
+}))
 
-  try {
-    const existing = await getAllUsers()
-    if (existing.find(u => u.email === e))
-      return res.status(409).json({ error: 'المستخدم مضاف بالفعل' })
+// PUT /api/auth/users/:email  { role }
+router.put('/users/:email', validate({ params: emailParams, body: roleBody }), asyncHandler(async (req, res) => {
+  await updateUserRole(req.valid.params.email, req.valid.body.role)
+  res.json({ success: true, users: await getAllUsers(), sheetReady: true })
+}))
 
-    await addUser(e, role, req.user.email)
-    const [users, sheetId] = await Promise.all([getAllUsers(), getUsersTabSheetId()])
-    res.json({ success: true, users, sheetId, sheetReady: true })
-  } catch (err) {
-    console.error('[auth/users POST]', err)
-    res.status(500).json({ error: err.message || 'Failed to add user' })
-  }
-})
-
-// ── PUT /api/auth/users/:rowIndex ────────────────────────────────────
-router.put('/users/:rowIndex', requireAuth, async (req, res) => {
-  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Admin only' })
-  const rowNum = parseInt(req.params.rowIndex)
-  const { role } = req.body
-  if (!role || !['admin', 'user'].includes(role)) return res.status(400).json({ error: 'Valid role required' })
-  if (isNaN(rowNum) || rowNum < 2) return res.status(400).json({ error: 'Invalid rowIndex' })
-
-  try {
-    await updateUserRole(rowNum, role)
-    await refreshCache()
-    const [users, sheetId] = await Promise.all([getAllUsers(), getUsersTabSheetId()])
-    res.json({ success: true, users, sheetId, sheetReady: true })
-  } catch (err) {
-    console.error('[auth/users PUT]', err)
-    res.status(500).json({ error: err.message || 'Failed to update role' })
-  }
-})
-
-// ── DELETE /api/auth/users/:rowIndex ─────────────────────────────────
-router.delete('/users/:rowIndex', requireAuth, async (req, res) => {
-  if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Admin only' })
-  const rowNum  = parseInt(req.params.rowIndex)
-  const sheetId = parseInt(req.query.sheetId)
-  if (isNaN(rowNum) || rowNum < 2) return res.status(400).json({ error: 'Invalid rowIndex' })
-  if (isNaN(sheetId)) return res.status(400).json({ error: 'sheetId query param required' })
-
-  try {
-    await removeUser(rowNum, sheetId)
-    await refreshCache()
-    const [users, sid] = await Promise.all([getAllUsers(), getUsersTabSheetId()])
-    res.json({ success: true, users, sheetId: sid, sheetReady: true })
-  } catch (err) {
-    console.error('[auth/users DELETE]', err)
-    res.status(500).json({ error: err.message || 'Failed to remove user' })
-  }
-})
+// DELETE /api/auth/users/:email
+router.delete('/users/:email', validate({ params: emailParams }), asyncHandler(async (req, res) => {
+  if (req.valid.params.email === req.user.email)
+    throw new HttpError(400, 'لا يمكنك حذف حسابك الحالي', 'SELF_DELETE')
+  await removeUser(req.valid.params.email)
+  res.json({ success: true, users: await getAllUsers(), sheetReady: true })
+}))
 
 export default router

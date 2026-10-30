@@ -4,3 +4,4 @@ pnpm-lock.yaml
 .env
 config.env
 api.zip
+/.github/

@@ -1,24 +1,17 @@
 // config/userStore.js
 //
-// Sheet-backed user management using the logged-in admin's Google OAuth token.
-// No Service Account or JSON key needed — the admin's token already has
-// spreadsheets scope from the login OAuth flow.
-//
-// Flow:
-//   1. Admin logs in → their Google token is saved in tokenStore
-//   2. auth.js calls setAdminToken() to give us a copy
-//   3. All sheet operations use that token
-//   4. If the token expires, the next admin login refreshes it automatically
+// Sheet-backed user management. Uses the service account when configured,
+// otherwise the most recently logged-in admin's Google OAuth token.
 //
 // Sheet tab "المستخدمون" columns: email | role | addedBy | addedAt
 
 import { tokenStore } from './tokenStore.js'
 import { getServiceToken } from './serviceAccount.js'
+import { USERS_TAB } from './tabs.js'
+import { HttpError } from '../middleware/errors.js'
+import * as sheets from '../services/googleSheets.js'
 
-const USERS_TAB     = 'المستخدمون'
 const USERS_HEADERS = ['email', 'role', 'addedBy', 'addedAt']
-// Read once at module load — env vars are immutable after startup.
-const SHEET_ID      = process.env.SHEET_ID
 
 // Parse bootstrap env arrays once; avoids split/map/filter on every request.
 const _bootstrapAdmins = (process.env.ADMIN_EMAILS || '')
@@ -34,72 +27,44 @@ export function setAdminEmail(email) {
   adminEmail = email
 }
 
-// ── Sheet fetch — service account preferred, admin token fallback ─────
-async function sheetFetch(url, options = {}) {
-  // Primary: service account token (never expires, auto-refreshes)
-  let token = await getServiceToken()
+// ── Token — service account preferred, admin token fallback ───────────
+async function getToken() {
+  const serviceToken = await getServiceToken()
+  if (serviceToken) return serviceToken
 
-  // Fallback: admin's OAuth token (expires after ~60 min)
-  if (!token) {
-    token = adminEmail ? tokenStore.get(adminEmail) : null
-    if (!token) throw new Error('لا يوجد مشرف مسجل دخوله حالياً. سجّل دخولك مرة أخرى.')
+  const token = adminEmail ? tokenStore.get(adminEmail) : null
+  if (!token) throw new Error('لا يوجد مشرف مسجل دخوله حالياً. سجّل دخولك مرة أخرى.')
+  return token
+}
+
+async function withToken(fn) {
+  const token = await getToken()
+  try {
+    return await fn(token)
+  } catch (err) {
+    if (err.status === 401) adminEmail = null
+    throw err
   }
-
-  const res = await fetch(url, {
-    ...options,
-    headers: {
-      Authorization:  `Bearer ${token}`,
-      'Content-Type': 'application/json',
-      ...(options.headers || {}),
-    },
-  })
-
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    if (res.status === 401) adminEmail = null
-    throw new Error(body?.error?.message || `Sheets API error ${res.status}`)
-  }
-  return res.json()
 }
 
 // ── Tab management ────────────────────────────────────────────────────
-// Once we confirm the tab exists (or create it) we set this flag so
-// subsequent addUser() calls skip the redundant metadata round-trip.
+// Once we confirm the tab exists (or create it) we skip the metadata round-trip.
 let _tabEnsured = false
-let _cachedTabSheetId = undefined  // undefined = not fetched; null = tab missing
 
-async function ensureTab() {
-  if (_tabEnsured) return  // skip network call after first successful check
-
-  const meta = await sheetFetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}?fields=sheets.properties`
-  )
-  const existing = (meta.sheets || []).find(s => s.properties.title === USERS_TAB)
-  if (existing) {
-    _cachedTabSheetId = existing.properties.sheetId
-    _tabEnsured = true
-    return
+async function ensureTab(token) {
+  if (_tabEnsured) return
+  const { tab } = await sheets.findTab(token, { title: USERS_TAB })
+  if (!tab) {
+    await sheets.addTab(token, USERS_TAB)
+    await sheets.writeHeaderCells(token, USERS_TAB, 1, USERS_HEADERS)
   }
-
-  await sheetFetch(`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}:batchUpdate`, {
-    method: 'POST',
-    body: JSON.stringify({ requests: [{ addSheet: { properties: { title: USERS_TAB } } }] }),
-  })
-  await sheetFetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(USERS_TAB + '!A1')}?valueInputOption=USER_ENTERED`,
-    { method: 'PUT', body: JSON.stringify({ values: [USERS_HEADERS] }) }
-  )
-  // Invalidate cached sheet ID so getUsersTabSheetId() re-fetches the new tab's ID
-  _cachedTabSheetId = undefined
   _tabEnsured = true
 }
 
-async function readAllRows() {
-  const data = await sheetFetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(USERS_TAB + '!A:D')}`
-  )
-  if (!data?.values || data.values.length < 2) return []
-  return data.values.slice(1).map((row, i) => ({
+async function readAllRows(token) {
+  const values = await sheets.readValues(token, USERS_TAB, 'A:D')
+  if (values.length < 2) return []
+  return values.slice(1).map((row, i) => ({
     __rowIndex: i + 2,
     email:    (row[0] || '').toLowerCase().trim(),
     role:      row[1] || 'user',
@@ -111,14 +76,21 @@ async function readAllRows() {
 // ── Cache ─────────────────────────────────────────────────────────────
 let cache     = null
 let cacheTime = 0
+let inFlight  = null
 const TTL_MS  = 60_000
 
-export async function refreshCache() {
-  await ensureTab()
-  const rows = await readAllRows()
-  cache     = new Map(rows.map(u => [u.email, u]))
-  cacheTime = Date.now()
-  return rows
+const isCacheFresh = () => cache && Date.now() - cacheTime <= TTL_MS
+
+/** Re-reads the users tab. Concurrent callers share one request. */
+export function refreshCache() {
+  inFlight ??= withToken(async token => {
+    await ensureTab(token)
+    const rows = await readAllRows(token)
+    cache     = new Map(rows.map(u => [u.email, u]))
+    cacheTime = Date.now()
+    return rows
+  }).finally(() => { inFlight = null })
+  return inFlight
 }
 
 // ── Public API ────────────────────────────────────────────────────────
@@ -128,21 +100,37 @@ export async function lookupUser(email) {
   const e = email.toLowerCase().trim()
 
   if (_bootstrapAdmins.includes(e)) return { email: e, role: 'admin' }
-
-  // Bootstrap users — defined in USER_EMAILS env var, always have role 'user'
-  if (_bootstrapUsers.includes(e)) return { email: e, role: 'user' }
+  if (_bootstrapUsers.includes(e))  return { email: e, role: 'user' }
 
   // Need a valid token (service account or admin) to read the sheet
-  if (!(await isReady())) {
-    return null
-  }
+  if (!(await isReady())) return null
 
-  if (!cache || Date.now() - cacheTime > TTL_MS) await refreshCache()
+  if (!isCacheFresh()) await refreshCache()
   return cache?.get(e) || null
 }
 
+/**
+ * Role for an already-authenticated user, checked on every request.
+ * Returns 'admin' | 'user', null if the user was removed, or undefined when
+ * the users list can't be read right now (caller keeps the JWT role).
+ */
+export async function getCurrentRole(email) {
+  const e = String(email || '').toLowerCase().trim()
+  if (_bootstrapAdmins.includes(e)) return 'admin'
+  if (_bootstrapUsers.includes(e))  return 'user'
+
+  try {
+    if (!(await isReady())) return undefined
+    if (!isCacheFresh()) await refreshCache()
+    return cache?.get(e)?.role ?? null
+  } catch (err) {
+    console.warn('[userStore] role check skipped:', err.message)
+    return undefined
+  }
+}
+
 export async function getAllUsers() {
-  if (!cache || Date.now() - cacheTime > TTL_MS) await refreshCache()
+  if (!isCacheFresh()) await refreshCache()
 
   const sheetUsers  = cache ? [...cache.values()] : []
   const sheetEmails = new Set(sheetUsers.map(u => u.email))
@@ -152,56 +140,49 @@ export async function getAllUsers() {
   const envUsers    = _bootstrapUsers
     .filter(e => !sheetEmails.has(e) && !_bootstrapAdmins.includes(e))
     .map(e => ({ email: e, role: 'user', addedBy: 'env', addedAt: '' }))
-  const envOnly = [...envAdmins, ...envUsers]
 
-  return [...envOnly, ...sheetUsers]
+  return [...envAdmins, ...envUsers, ...sheetUsers]
 }
 
 export async function addUser(email, role, addedBy) {
   const e = email.toLowerCase().trim()
-  await ensureTab()
   const now = new Date().toLocaleDateString('ar-EG')
-  await sheetFetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(USERS_TAB + '!A:D')}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
-    { method: 'POST', body: JSON.stringify({ values: [[e, role, addedBy, now]] }) }
-  )
-  cache = null
-}
-
-export async function removeUser(rowIndex, tabSheetId) {
-  await sheetFetch(`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}:batchUpdate`, {
-    method: 'POST',
-    body: JSON.stringify({
-      requests: [{ deleteDimension: {
-        range: { sheetId: tabSheetId, dimension: 'ROWS', startIndex: rowIndex - 1, endIndex: rowIndex },
-      }}],
-    }),
+  await withToken(async token => {
+    await ensureTab(token)
+    await sheets.appendRows(token, USERS_TAB, [[e, role, addedBy, now]])
   })
   cache = null
 }
 
-export async function updateUserRole(rowIndex, role) {
-  await sheetFetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(USERS_TAB + '!B' + rowIndex)}?valueInputOption=USER_ENTERED`,
-    { method: 'PUT', body: JSON.stringify({ values: [[role]] }) }
+/** Looks the row up fresh by email, so a stale row number can never hit another user. */
+async function findSheetUser(email) {
+  await refreshCache()
+  const user = cache?.get(email.toLowerCase().trim())
+  if (!user) throw new HttpError(404, 'المستخدم غير موجود في الشيت', 'USER_NOT_FOUND')
+  return user
+}
+
+export async function updateUserRole(email, role) {
+  const user = await findSheetUser(email)
+  await withToken(token =>
+    sheets.updateRows(token, USERS_TAB, [{ rowIndex: user.__rowIndex, values: [user.email, role] }]),
   )
   cache = null
 }
 
-export async function getUsersTabSheetId() {
-  // Return cached value — the tab's numeric sheetId never changes once created.
-  if (_cachedTabSheetId !== undefined) return _cachedTabSheetId
-  const meta = await sheetFetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}?fields=sheets.properties`
-  )
-  const tab = (meta.sheets || []).find(s => s.properties.title === USERS_TAB)
-  _cachedTabSheetId = tab ? tab.properties.sheetId : null
-  return _cachedTabSheetId
+export async function removeUser(email) {
+  const user = await findSheetUser(email)
+  await withToken(async token => {
+    const { tab } = await sheets.findTab(token, { title: USERS_TAB })
+    if (!tab) throw new HttpError(404, 'تبويب المستخدمين غير موجود', 'TAB_NOT_FOUND')
+    await sheets.deleteRows(token, tab.sheetId, [user.__rowIndex])
+  })
+  cache = null
 }
 
 /** True if we have a valid token to access sheets (service account or admin). */
 export async function isReady() {
-  const saToken = await getServiceToken()
-  if (saToken) return true
+  const serviceToken = await getServiceToken()
+  if (serviceToken) return true
   return !!(adminEmail && tokenStore.get(adminEmail))
 }

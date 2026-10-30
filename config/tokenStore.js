@@ -33,8 +33,11 @@ import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'crypt
 // ── Derive a 32-byte AES key from JWT_SECRET ─────────────────────────
 // Computed ONCE at module load. JWT_SECRET is immutable after startup,
 // so re-hashing on every encrypt/decrypt call wastes CPU on every request.
+if (!process.env.JWT_SECRET) {
+  throw new Error('JWT_SECRET is required (used to derive the token encryption key)')
+}
 const _aesKey = createHash('sha256')
-  .update(process.env.JWT_SECRET || 'fallback-secret-change-me')
+  .update(process.env.JWT_SECRET)
   .digest()
 
 const ALGORITHM = 'aes-256-gcm'

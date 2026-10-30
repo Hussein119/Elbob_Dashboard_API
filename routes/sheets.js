@@ -387,4 +387,55 @@ router.post('/batch-rows', requireAuth, async (req, res) => {
   }
 })
 
+// ─────────────────────────────────────────────────────────────────────
+// POST /api/sheets/batch-delete
+// Body: { sheetId, rowIndices: [5, 6, 9] }
+// Deletes multiple rows in a single Google Sheets batchUpdate call.
+// ─────────────────────────────────────────────────────────────────────
+router.post('/batch-delete', requireAuth, async (req, res) => {
+  const googleToken = await getGoogleToken(req, res)
+  if (!googleToken) return
+
+  const { sheetId, rowIndices } = req.body
+  const sheetIdNum = parseInt(sheetId, 10)
+  if (isNaN(sheetIdNum)) {
+    return res.status(400).json({ error: 'sheetId is required' })
+  }
+  if (!Array.isArray(rowIndices) || rowIndices.length === 0) {
+    return res.status(400).json({ error: 'rowIndices[] is required' })
+  }
+
+  const rows = [...new Set(rowIndices.map(r => parseInt(r, 10)))]
+  if (rows.some(r => isNaN(r) || r < 2)) {
+    return res.status(400).json({ error: 'Invalid rowIndex in rowIndices' })
+  }
+  // Requests run in order, so delete bottom-up to keep the remaining indices valid
+  rows.sort((a, b) => b - a)
+
+  try {
+    const url  = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}:batchUpdate`
+    const gRes = await fetch(url, {
+      method:  'POST',
+      headers: { Authorization: `Bearer ${googleToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        requests: rows.map(rowNum => ({
+          deleteDimension: {
+            range: {
+              sheetId:    sheetIdNum,
+              dimension:  'ROWS',
+              startIndex: rowNum - 1,
+              endIndex:   rowNum,
+            },
+          },
+        })),
+      }),
+    })
+    if (!gRes.ok) return handleGoogleError(gRes, res)
+    res.json({ deleted: rows.length })
+  } catch (err) {
+    console.error('[sheets/batch-delete]', err)
+    res.status(500).json({ error: 'Failed to batch delete rows' })
+  }
+})
+
 export default router

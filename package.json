@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node ./api/index.js",
-    "dev": "node --env-file=.env --watch api/index.js"
+    "dev": "node --env-file=.env --watch api/index.js",
+    "archive": "node --env-file=.env scripts/archive.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

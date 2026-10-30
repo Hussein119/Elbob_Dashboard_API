@@ -39,6 +39,8 @@ Generate a JWT secret: `node -e "console.log(require('crypto').randomBytes(64).t
 - **Stale-row guard**: row PUT / DELETE / batch-rows / batch-delete accept `expected` (the row as the client last read it, including its ID). The server finds the row by that ID wherever it moved, then compares content; if the record is gone or changed it returns 409 `{ code: 'STALE_ROWS' }` and writes nothing.
 - **Delete endpoint contract**: `DELETE /api/sheets/row/:rowIndex` requires `?sheetId=<numeric>`.
 - **Users**: `/api/auth/users/:email` (PUT role, DELETE) — users are identified by email, never by row number.
+- **Archive** (`services/archive.js`): rows older than `ARCHIVE_AFTER_MONTHS` (whole months) move to the spreadsheet `ARCHIVE_SHEET_ID` — copy → verify → delete, upsert by row ID, lock + log tabs in the archive file. Open records, unreadable dates and invoice/order pairs with an open partner stay. Run by Vercel Cron (`GET /api/archive/run`, `Bearer CRON_SECRET`) or `npm run archive -- --dry-run | --run | --totals | --restore --tab X`. The app reads archived rows read-only via `GET /api/sheets/archive?tabName=&year=`.
+- **Two spreadsheets**: `spreadsheetClient(id)` in `services/googleSheets.js`; the named exports are bound to the main sheet.
 - **Google calls**: always via `services/googleSheets.js` (`googleFetch` retries 429/5xx; tab metadata cached 5 min; text cells starting with `=`/`@`/`+`/`-` are stored as text).
 - **Role checks**: `requireAuth` re-reads the user's role from the users tab (60 s cache) on every request, so removals and role changes apply immediately.
 - **Google token expiry**: Tokens expire ~60 min. Frontend must handle `{ code: 'GOOGLE_TOKEN_EXPIRED' }` responses and re-login, or rely on service account (no expiry).
@@ -70,6 +72,11 @@ controllers/sheetsController.js
 services/
   googleSheets.js     # Google API client: retry, metadata cache, sanitizing, stale-row check
   sheetRecords.js     # Tab-access-checked row operations
+  rowIds.js           # Column-Z row IDs
+  archive.js          # Archive job, restore, totals, archived-row reads
+routes/archive.js     # /api/archive/* — run (cron/admin), log, restore
+scripts/archive.js    # Local runner for the first big archive run
+utils/dates.js        # Sheet date parsing (server side)
 routes/auth.js        # /api/auth/* — verify, me, logout, user management (admin)
 routes/sheets.js      # /api/sheets/* — paths + middleware only
 ```

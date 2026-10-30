@@ -11,7 +11,9 @@ import { ensureJsonBody } from '../middleware/jsonBody.js'
 import { validate }       from '../middleware/validate.js'
 import { asyncHandler }   from '../middleware/errors.js'
 import * as schemas       from '../schemas/sheets.js'
+import * as archiveSchemas from '../schemas/archive.js'
 import * as sheets        from '../controllers/sheetsController.js'
+import * as archive       from '../controllers/archiveController.js'
 
 const router = Router()
 
@@ -22,6 +24,9 @@ router.get('/data', validate({ query: schemas.dataQuery }), asyncHandler(sheets.
 
 // GET /api/sheets/tab-data?tabName=...  — { values, tabName, sheetId | null }
 router.get('/tab-data', validate({ query: schemas.tabDataQuery }), asyncHandler(sheets.getTabData))
+
+// GET /api/sheets/archive?tabName=...&year=2024  — read-only archived rows + { years }
+router.get('/archive', validate({ query: archiveSchemas.archivedRowsQuery }), asyncHandler(archive.getArchivedRows))
 
 // POST /api/sheets/append  { sheetName, values: [[...]] }
 router.post('/append', validate({ body: schemas.appendBody }), asyncHandler(sheets.append))

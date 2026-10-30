@@ -8,15 +8,34 @@
 import { HttpError } from '../middleware/errors.js'
 
 export const USERS_TAB = 'المستخدمون'
+export const SALES_TAB = 'المبيعات'
+
+// Old tab names still sent by browsers with cached data → current name
+export const TAB_ALIASES = {
+  'Elbob Dashboard': SALES_TAB,
+}
 
 export const TAB_ACCESS = {
-  'Elbob Dashboard':  'user',
+  [SALES_TAB]:        'user',
   'فواتير الجملة':    'user',
   'عروض الأسعار':     'user',
   'مشتريات بضاعة':    'admin',
   'المصروفات':        'admin',
   'الرواتب والتوزيع': 'admin',
   'حسابات الدائنين':  'admin',
+}
+
+/**
+ * The spreadsheet tab a requested name refers to: exact title, then an old
+ * alias, then — for the sales tab before it has been renamed — the first tab.
+ */
+export function findConfiguredTab(tabs, title) {
+  const byTitle = name => tabs.find(t => t.title === name)
+  return byTitle(title)
+    || (TAB_ALIASES[title] && byTitle(TAB_ALIASES[title]))
+    || (title === SALES_TAB && Object.keys(TAB_ALIASES).map(byTitle).find(Boolean))
+    || (title === SALES_TAB ? tabs[0] : null)
+    || null
 }
 
 /** Throws 403 unless `user` may access the tab titled `title`. `tabs` = spreadsheet tabs in order. */

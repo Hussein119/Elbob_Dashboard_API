@@ -7,6 +7,7 @@ import rateLimit      from 'express-rate-limit'
 import jwt            from 'jsonwebtoken'
 import authRoutes     from '../routes/auth.js'
 import sheetsRoutes   from '../routes/sheets.js'
+import archiveRoutes  from '../routes/archive.js'
 import { notFound, errorHandler } from '../middleware/errors.js'
 
 // ── Validate required env vars ──────────────────────────────────────
@@ -86,6 +87,7 @@ const sheetsLimiter = rateLimit({
 // ── Routes ───────────────────────────────────────────────────────────
 app.use('/api/auth',   authLimiter,   authRoutes)
 app.use('/api/sheets', sheetsLimiter, sheetsRoutes)
+app.use('/api/archive', sheetsLimiter, archiveRoutes)
 
 // ── Health check ─────────────────────────────────────────────────────
 app.get('/health', (_, res) => {

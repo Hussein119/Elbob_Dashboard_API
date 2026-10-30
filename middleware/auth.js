@@ -4,6 +4,7 @@
 // of when the (long-lived) JWT expires.
 
 import jwt from 'jsonwebtoken'
+import { timingSafeEqual } from 'crypto'
 import { HttpError, asyncHandler } from './errors.js'
 import { getCurrentRole } from '../config/userStore.js'
 
@@ -32,6 +33,21 @@ export const requireAuth = asyncHandler(async (req, _res, next) => {
   req.user = { ...payload, role: currentRole ?? payload.role }  // { userId, name, email, role, iat, exp }
   next()
 })
+
+/**
+ * Vercel Cron calls with `Authorization: Bearer <CRON_SECRET>`; anyone else
+ * must be a signed-in admin.
+ */
+export function requireCronOrAdmin(req, res, next) {
+  const secret   = process.env.CRON_SECRET
+  const given    = Buffer.from(req.headers.authorization || '')
+  const expected = Buffer.from(`Bearer ${secret}`)
+  if (secret && given.length === expected.length && timingSafeEqual(given, expected)) {
+    req.user = { userId: 'cron', email: 'cron', name: 'Cron', role: 'admin' }
+    return next()
+  }
+  requireAuth(req, res, err => (err ? next(err) : requireAdmin(req, res, next)))
+}
 
 export function requireAdmin(req, _res, next) {
   if (req.user?.role !== 'admin') {

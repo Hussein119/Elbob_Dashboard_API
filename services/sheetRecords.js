@@ -8,13 +8,25 @@
 
 import * as sheets from './googleSheets.js'
 import * as rowIds from './rowIds.js'
-import { assertTabAccess, canCreateTab } from '../config/tabs.js'
+import { assertTabAccess, canCreateTab, findConfiguredTab } from '../config/tabs.js'
 import { HttpError } from '../middleware/errors.js'
 
-async function resolveTabByTitle(token, user, title) {
-  const { tab, tabs } = await sheets.findTab(token, { title })
+/**
+ * { tab, title } for a requested tab name (old names resolve to the current
+ * tab). `title` is the real tab title to use for every Google call; `tab` is
+ * null when the tab doesn't exist yet.
+ */
+async function resolveTabByTitle(token, user, requested) {
+  let tabs = await sheets.getTabs(token)
+  let tab  = findConfiguredTab(tabs, requested)
+  if (!tab || tab.title !== requested) {
+    // Metadata may be stale (tab just created / renamed) — check once more
+    tabs = await sheets.getTabs(token, { fresh: true })
+    tab  = findConfiguredTab(tabs, requested)
+  }
+  const title = tab?.title ?? requested
   assertTabAccess(user, title, tabs)
-  return tab
+  return { tab, title }
 }
 
 async function resolveTabById(token, user, sheetId) {
@@ -38,11 +50,8 @@ async function readWithIds(token, title) {
 
 /** Named tab, or the first tab when `tabName` is omitted / unknown. */
 export async function readTabOrFirst(token, user, tabName) {
-  let target = null
-  let tabs
-  if (tabName) ({ tab: target, tabs } = await sheets.findTab(token, { title: tabName }))
-  else tabs = await sheets.getTabs(token)
-  target ||= tabs[0]
+  const tabs = await sheets.getTabs(token)
+  const target = (tabName && findConfiguredTab(tabs, tabName)) || tabs[0]
   if (!target) throw new HttpError(404, 'Spreadsheet has no tabs', 'TAB_NOT_FOUND')
 
   assertTabAccess(user, target.title, tabs)
@@ -52,30 +61,30 @@ export async function readTabOrFirst(token, user, tabName) {
 
 /** sheetId is null (and values empty) when the tab hasn't been created yet. */
 export async function readTab(token, user, tabName) {
-  const tab = await resolveTabByTitle(token, user, tabName)
-  if (!tab) return { values: [], tabName, sheetId: null }
-  const values = await readWithIds(token, tab.title)
-  return { values, tabName, sheetId: tab.sheetId }
+  const { tab, title } = await resolveTabByTitle(token, user, tabName)
+  if (!tab) return { values: [], tabName: title, sheetId: null }
+  const values = await readWithIds(token, title)
+  return { values, tabName: title, sheetId: tab.sheetId }
 }
 
 export async function appendRows(token, user, tabName, rows) {
-  await resolveTabByTitle(token, user, tabName)
-  const withIds = await rowIds.hasIdColumn(token, tabName)
-  return sheets.appendRows(token, tabName, withIds ? rows.map(rowIds.withNewId) : rows)
+  const { title } = await resolveTabByTitle(token, user, tabName)
+  const withIds = await rowIds.hasIdColumn(token, title)
+  return sheets.appendRows(token, title, withIds ? rows.map(rowIds.withNewId) : rows)
 }
 
 export async function updateRow(token, user, tabName, rowIndex, row, expected) {
-  await resolveTabByTitle(token, user, tabName)
-  const [target] = await lockRows(token, tabName, [{ rowIndex, expected }])
-  const withIds = await rowIds.hasIdColumn(token, tabName)
-  return sheets.updateRow(token, tabName, target.rowIndex, withIds ? rowIds.stripIdColumn(row) : row)
+  const { title } = await resolveTabByTitle(token, user, tabName)
+  const [target] = await lockRows(token, title, [{ rowIndex, expected }])
+  const withIds = await rowIds.hasIdColumn(token, title)
+  return sheets.updateRow(token, title, target.rowIndex, withIds ? rowIds.stripIdColumn(row) : row)
 }
 
 export async function updateRows(token, user, tabName, updates) {
-  await resolveTabByTitle(token, user, tabName)
-  const targets = await lockRows(token, tabName, updates)
-  const withIds = await rowIds.hasIdColumn(token, tabName)
-  await sheets.updateRows(token, tabName, targets.map(({ rowIndex, values }) => ({
+  const { title } = await resolveTabByTitle(token, user, tabName)
+  const targets = await lockRows(token, title, updates)
+  const withIds = await rowIds.hasIdColumn(token, title)
+  await sheets.updateRows(token, title, targets.map(({ rowIndex, values }) => ({
     rowIndex,
     values: withIds ? rowIds.stripIdColumn(values) : values,
   })))
@@ -98,30 +107,30 @@ export async function deleteRows(token, user, sheetId, rowIndices, expectedByRow
  * `updated` tells the client whether row 1 changed.
  */
 export async function ensureTab(token, user, tabName, headers) {
-  const tab = await resolveTabByTitle(token, user, tabName)
+  const { tab, title } = await resolveTabByTitle(token, user, tabName)
   const wanted = headers.filter(h => h !== rowIds.ID_HEADER)
 
   if (tab) {
-    const [currentRow = []] = await sheets.readValues(token, tabName, '1:1')
+    const [currentRow = []] = await sheets.readValues(token, title, '1:1')
     const missing = wanted.filter(h => !currentRow.includes(h))
     if (missing.length > 0) {
       let lastUsed = -1
       currentRow.forEach((h, i) => { if (h && i < rowIds.ID_COL_INDEX) lastUsed = i })
       const startCol = lastUsed + 2
       if (startCol + missing.length - 1 > rowIds.ID_COL_INDEX) {
-        throw new HttpError(500, `لا توجد أعمدة فاضية قبل عمود ID في "${tabName}"`, 'NO_FREE_COLUMNS')
+        throw new HttpError(500, `لا توجد أعمدة فاضية قبل عمود ID في "${title}"`, 'NO_FREE_COLUMNS')
       }
-      await sheets.ensureColumnCount(token, tabName, startCol + missing.length - 1)
-      await sheets.writeHeaderCells(token, tabName, startCol, missing)
+      await sheets.ensureColumnCount(token, title, startCol + missing.length - 1)
+      await sheets.writeHeaderCells(token, title, startCol, missing)
     }
-    return { created: false, updated: missing.length > 0, sheetId: tab.sheetId, tabName }
+    return { created: false, updated: missing.length > 0, sheetId: tab.sheetId, tabName: title }
   }
 
-  if (!canCreateTab(tabName)) {
-    throw new HttpError(403, `غير مسموح بإنشاء التبويب "${tabName}"`, 'TAB_FORBIDDEN')
+  if (!canCreateTab(title)) {
+    throw new HttpError(403, `غير مسموح بإنشاء التبويب "${title}"`, 'TAB_FORBIDDEN')
   }
-  const sheetId = await sheets.addTab(token, tabName)
-  await sheets.writeHeaderCells(token, tabName, 1, wanted)
-  await sheets.writeHeaderCells(token, tabName, rowIds.ID_COL_INDEX + 1, [rowIds.ID_HEADER])
-  return { created: true, updated: true, sheetId, tabName }
+  const sheetId = await sheets.addTab(token, title)
+  await sheets.writeHeaderCells(token, title, 1, wanted)
+  await sheets.writeHeaderCells(token, title, rowIds.ID_COL_INDEX + 1, [rowIds.ID_HEADER])
+  return { created: true, updated: true, sheetId, tabName: title }
 }
